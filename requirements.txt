@@ -1,0 +1,22 @@
+# Python dependencies for secops_snapshot (WSL)
+# This project uses only the Python standard library; no pip packages are required.
+#
+# External CLI tools (install via apt) required for full functionality:
+# - whois (package: whois)
+# - dig (package: dnsutils)
+# - curl (package: curl)
+# - jq (package: jq)
+# - pandoc (package: pandoc)  # for PDF report generation
+# - TeX engine for Pandoc PDF (packages: texlive-latex-recommended texlive-fonts-recommended texlive-xetex)
+# - whatweb (package: whatweb)
+# - subfinder (ProjectDiscovery repo)  # see install commands in README or setup notes
+## Example (WSL/Ubuntu):
+# sudo apt-get update && sudo apt-get install -y \
+#   whois dnsutils curl jq pandoc \
+#   texlive-latex-recommended texlive-fonts-recommended texlive-xetex \
+#   whatweb
+# For subfinder, install from ProjectDiscovery releases or via Go:
+#   sudo apt-get install -y golang && \
+#   GO111MODULE=on go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest && \
+#   echo 'export PATH="$HOME/go/bin:$PATH"' >> ~/.bashrc
+
