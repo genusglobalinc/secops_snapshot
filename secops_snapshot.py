@@ -31,6 +31,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("secops_snapshot")
 
+class _InMemoryLogHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+        except Exception:
+            msg = record.getMessage()
+        self.records.append(msg)
+
+_log_memory_handler = _InMemoryLogHandler()
+_log_memory_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s"))
+logger.addHandler(_log_memory_handler)
+
 # =========================
 # CONFIGURATION
 # =========================
@@ -197,6 +212,12 @@ def _prompt_int_in_range(msg: str, lo: int = 0, hi: int = 100) -> int:
         if val is not None:
             return val
         logger.warning("Please enter an integer between %s and %s.", lo, hi)
+
+def _read_text(path: Path, default: str = "") -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return default
 
 # =========================
 # CASE INITIALIZATION
@@ -377,8 +398,39 @@ def risk_scoring(case_dir, state):
 def generate_report(case_dir, state):
     logger.debug("Starting generate_report step")
     # CHECKLIST: report_generated
-    md_path = case_dir / "reports" / "report.md"
+    # Collect artifacts
+    recon_dir = case_dir / "recon"
+    whois_txt = _read_text(recon_dir / "whois.txt")
+    dns_txt = _read_text(recon_dir / "dns.txt")
+    headers_txt = _read_text(recon_dir / "headers.txt")
+    robots_txt = _read_text(recon_dir / "robots.txt")
+    whatweb_txt = _read_text(recon_dir / "whatweb.txt")
+    subdomains_txt = _read_text(recon_dir / "subdomains.txt")
+    crtsh_txt = _read_text(recon_dir / "crtsh.txt")
+    ssl_labs_txt = _read_text(recon_dir / "ssl_labs.txt")
+    shodan_txt = _read_text(recon_dir / "shodan.txt")
 
+    # Checklist summary
+    ck = state.get("checklist", {})
+    def ck_mark(k):
+        return "[x]" if ck.get(k) else "[ ]"
+
+    checklist_md = "\n".join([
+        f"- {ck_mark('whois')} WHOIS",
+        f"- {ck_mark('dns')} DNS",
+        f"- {ck_mark('headers')} HTTP Headers",
+        f"- {ck_mark('robots')} robots.txt",
+        f"- {ck_mark('tech_stack')} WhatWeb",
+        f"- {ck_mark('subdomains')} Subdomains",
+        f"- {ck_mark('crtsh')} crt.sh",
+        f"- {ck_mark('ssl')} SSL Labs (manual)",
+        f"- {ck_mark('shodan')} Shodan (manual)",
+        f"- {ck_mark('screenshots')} Screenshots",
+        f"- {ck_mark('risk_score')} Risk Score",
+        f"- {ck_mark('report_generated')} Report Generated",
+    ])
+
+    # Build base report
     report = REPORT_TEMPLATE
     replacements = {
         "{{business_name}}": state["business_name"],
@@ -388,28 +440,59 @@ def generate_report(case_dir, state):
         "{{exposure_rating}}": "Moderate",
         "{{exposure_score}}": str(state["risk_score"]),
         "{{summary}}": "Passive exposure indicators were identified.",
-        "{{exposure_table}}": "Refer to recon outputs.",
-        "{{key_observations}}": "See findings.",
+        "{{exposure_table}}": checklist_md,
+        "{{key_observations}}": "See recon artifacts and notes below.",
         "{{recommendations}}": "Authorized active assessment recommended.",
         "{{contact}}": "you@company.com"
     }
-
     for k, v in replacements.items():
         report = report.replace(k, v)
 
-    md_path.write_text(report)
-    logger.debug("generate_report(): wrote markdown to %s", md_path)
+    # Recon sections and manual notes
+    def section(title, body):
+        body = body.strip()
+        if not body:
+            body = "(no data)"
+        return f"\n\n## {title}\n\n```\n{body}\n```\n"
 
-    pdf_path = case_dir / 'reports' / 'report.pdf'
+    report += section("WHOIS", whois_txt)
+    report += section("DNS (dig)", dns_txt)
+    report += section("HTTP Headers", headers_txt)
+    report += section("robots.txt", robots_txt)
+    report += section("WhatWeb", whatweb_txt)
+    report += section("Subdomains (subfinder)", subdomains_txt)
+    report += section("crt.sh", crtsh_txt)
+    report += section("SSL Labs (manual notes)", ssl_labs_txt)
+    report += section("Shodan (manual notes)", shodan_txt)
+
+    # Execution log
+    logs = "\n".join(getattr(_log_memory_handler, "records", []))
+    report += section("Run Log", logs)
+
+    # Write to case directory (existing behavior)
+    md_path_case = case_dir / "reports" / "report.md"
+    md_path_case.write_text(report)
+    logger.debug("generate_report(): wrote markdown to %s", md_path_case)
+
+    # Also write a copy into current working directory named after the case
+    safe_client = _safe_slug(state.get("client", "case"))
+    md_path_cwd = Path.cwd() / f"{safe_client}_report.md"
+    md_path_cwd.write_text(report)
+    logger.debug("generate_report(): wrote markdown to %s", md_path_cwd)
+
+    # PDF (if pandoc present) - produce in both locations
     if shutil.which("pandoc") is None:
         logger.warning("pandoc not found; skipping PDF generation")
     else:
-        logger.debug("generate_report(): invoking pandoc to produce %s", pdf_path)
-        result = subprocess.run(
-            f"pandoc \"{md_path}\" -o \"{pdf_path}\"",
-            shell=True
-        )
-        logger.debug("pandoc return code: %s", getattr(result, "returncode", None))
+        pdf_case = case_dir / 'reports' / 'report.pdf'
+        pdf_cwd = Path.cwd() / f"{safe_client}_report.pdf"
+        for src, dst in ((md_path_case, pdf_case), (md_path_cwd, pdf_cwd)):
+            logger.debug("generate_report(): invoking pandoc to produce %s", dst)
+            result = subprocess.run(
+                f"pandoc \"{src}\" -o \"{dst}\"",
+                shell=True
+            )
+            logger.debug("pandoc return code: %s", getattr(result, "returncode", None))
 
     state["checklist"]["report_generated"] = True
 
