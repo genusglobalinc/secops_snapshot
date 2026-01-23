@@ -19,6 +19,8 @@ import subprocess
 import datetime
 import shutil
 from pathlib import Path
+import re
+from urllib.parse import urlparse
 
 import logging
 
@@ -130,6 +132,19 @@ def prompt(msg):
 def yes_no(msg):
     return input(f"[?] {msg} (y/n): ").lower().startswith("y")
 
+def prompt_multiline(msg: str, end_marker: str = "END") -> str:
+    print(f"[+] {msg} (finish with a single line '{end_marker}')")
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip() == end_marker:
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
 def _missing_pipeline_tools(cmd: str):
     tools = []
     for segment in cmd.split("|"):
@@ -146,6 +161,43 @@ def _missing_pipeline_tools(cmd: str):
             tools.append(base)
     return tools
 
+def _normalize_domain(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    u = urlparse(s if re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', s) else f"//{s}", allow_fragments=False)
+    host = u.netloc or u.path
+    host = host.split('/')[0]
+    if ':' in host:
+        host = host.split(':')[0]
+    host = host.strip().strip('.')
+    return host
+
+def _safe_slug(s: str) -> str:
+    s = (s or "").strip().replace(" ", "_")
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", s)
+    s = s.strip("-_.")
+    return s or "client"
+
+def _extract_score(text: str, lo: int, hi: int):
+    if text is None:
+        return None
+    for part in str(text).splitlines():
+        m = re.fullmatch(r"\s*(\d{1,3})\s*", part)
+        if m:
+            v = int(m.group(1))
+            if lo <= v <= hi:
+                return v
+    return None
+
+def _prompt_int_in_range(msg: str, lo: int = 0, hi: int = 100) -> int:
+    while True:
+        raw = prompt(msg)
+        val = _extract_score(raw, lo, hi)
+        if val is not None:
+            return val
+        logger.warning("Please enter an integer between %s and %s.", lo, hi)
+
 # =========================
 # CASE INITIALIZATION
 # CHECKLIST: (none)
@@ -158,7 +210,11 @@ def init_case():
     domain = prompt("Primary domain (example.com)")
     business = prompt("Business legal name")
 
-    case_dir = CLIENTS_DIR / client
+    # Normalize inputs
+    norm_domain = _normalize_domain(domain)
+    safe_client = _safe_slug(client)
+
+    case_dir = CLIENTS_DIR / safe_client
     dirs = ["scope", "recon", "scans", "evidence", "reports", "notes"]
 
     for d in dirs:
@@ -175,7 +231,7 @@ def init_case():
     state = {
         "client": client,
         "business_name": business,
-        "domain": domain,
+        "domain": norm_domain,
         "date": str(datetime.date.today()),
         "checklist": CHECKLIST_ITEMS.copy(),
         "findings": [],
@@ -185,7 +241,7 @@ def init_case():
     with open(case_dir / "notes" / "state.json", "w") as f:
         json.dump(state, f, indent=2)
     logger.debug("init_case(): state written to %s", case_dir / "notes" / "state.json")
-    logger.debug("init_case(): initialized (client=%s, domain=%s, date=%s)", client, domain, state["date"])
+    logger.debug("init_case(): initialized (client=%s -> %s, domain=%s -> %s, date=%s)", client, safe_client, domain, norm_domain, state["date"])
     print("[+] Case initialized")
     return case_dir, state
 
@@ -274,7 +330,7 @@ def manual_ssl(case_dir, state):
     # CHECKLIST: ssl
     print("[!] Manual Step: Run SSL Labs scan")
     print("    https://www.ssllabs.com/ssltest/")
-    notes = prompt("Paste SSL grade & notes")
+    notes = prompt_multiline("Paste SSL grade & notes")
     (case_dir / "recon" / "ssl_labs.txt").write_text(notes)
     state["checklist"]["ssl"] = True
     logger.debug("manual_ssl(): notes saved to %s", case_dir / "recon" / "ssl_labs.txt")
@@ -283,7 +339,7 @@ def manual_shodan(case_dir, state):
     logger.debug("Starting manual_shodan step")
     # CHECKLIST: shodan
     print("[!] Manual Step: Shodan search hostname")
-    notes = prompt("Paste Shodan findings")
+    notes = prompt_multiline("Paste Shodan findings")
     (case_dir / "recon" / "shodan.txt").write_text(notes)
     state["checklist"]["shodan"] = True
     logger.debug("manual_shodan(): notes saved to %s", case_dir / "recon" / "shodan.txt")
@@ -309,7 +365,7 @@ def upload_screenshots(case_dir, state):
 def risk_scoring(case_dir, state):
     logger.debug("Starting risk_scoring step")
     # CHECKLIST: risk_score
-    score = int(prompt("Enter overall exposure score (0–100)"))
+    score = _prompt_int_in_range("Enter overall exposure score (0–100)")
     state["risk_score"] = score
     state["checklist"]["risk_score"] = True
     logger.debug("risk_scoring(): set risk_score=%s", score)
