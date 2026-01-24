@@ -21,6 +21,15 @@ import shutil
 from pathlib import Path
 import re
 from urllib.parse import urlparse
+import getpass
+try:
+    from openai import OpenAI as _OpenAIClient  # New-style client
+except Exception:  # pragma: no cover
+    _OpenAIClient = None
+try:
+    import openai as _openai_mod  # Legacy client
+except Exception:  # pragma: no cover
+    _openai_mod = None
 
 import logging
 
@@ -52,48 +61,93 @@ logger.addHandler(_log_memory_handler)
 
 BASE_DIR = Path.home() / "secops"
 CLIENTS_DIR = BASE_DIR / "clients"
+CONFIG_FILE = BASE_DIR / "config.json"
 
 REPORT_TEMPLATE = """
 # Passive Security Exposure Snapshot
 
-Prepared for: {{business_name}}
+Prepared for: {{Business Name}}
 Website: {{domain}}
 Date: {{date}}
-Prepared by: {{prepared_by}}
+Prepared by: {{Your Business Name}}
 
 ---
 
 ## 1. Executive Summary
-Overall Exposure Rating: {{exposure_rating}}
-Overall Exposure Score: {{exposure_score}} / 100
+This snapshot provides a high‑level overview of publicly observable security exposures associated with your
+website and online presence. The findings below are based only on passive analysis and publicly
+available information — no intrusive testing or exploitation was performed.
 
-{{summary}}
+Overall Exposure Rating: {{Overall Exposure Rating}}
+Overall Exposure Score: {{Overall Exposure Score}}
+
+In its current state, your digital presence exposes information that could increase the likelihood of:
+- Unauthorized access attempts
+- Service disruption or downtime
+- Credential abuse or account takeover
+- Reputational and financial impact
+
+This report is intended to help you understand risk, not to alarm — and to outline clear next steps if you
+choose to reduce exposure.
 
 ---
 
 ## 2. Exposure Overview
-{{exposure_table}}
+
+| Area | Status | Risk Level |
+|---|---|---|
+| Domain & DNS Configuration | Observed | {{Area_Domain_DNS}} |
+| Website Technology Stack | Observed | {{Area_Tech_Stack}} |
+| Email & Credential Exposure | Observed | {{Area_Email_Creds}} |
+| SSL / Transport Security | Observed | {{Area_SSL}} |
+| Security Headers | Observed | {{Area_Sec_Headers}} |
 
 ---
 
-## 3. Key Observations
-{{key_observations}}
+## 3. Key Observations (Top 3–5)
+{{observations_section}}
 
 ---
 
-## 4. Recommended Next Steps
-{{recommendations}}
+## 4. Exposure Risk Score
+Overall Exposure Score: {{Overall Exposure Score}}
+This score reflects how easily a threat actor could gather information about your systems using the same
+techniques commonly employed in real‑world attacks against small businesses.
+Note: This score does not represent confirmed exploitation — only exposure likelihood.
 
 ---
 
-## 5. Authorization & Disclosure
-This report was generated using **passive analysis only**.
-No authentication attempts, exploitation, or service disruption occurred.
+## 5. Recommended Next Steps
+To better understand and reduce risk, organizations typically proceed with:
+- Authorized active vulnerability scanning
+- Manual validation of findings
+- Prioritized remediation guidance
+- Optional retesting after fixes
+
+These steps require explicit written authorization and are not included in this snapshot.
 
 ---
 
-## 6. Optional Consultation
+## 6. Authorization & Disclosure
+This report was generated using passive analysis methods only:
+- No login attempts were made
+- No exploitation was performed
+- No service disruption occurred
+
+All findings are based on publicly accessible information at the time of review.
+
+---
+
+## 7. Optional Consultation
+If you would like:
+- Clarification on any findings
+- A deeper authorized assessment
+- Assistance reducing exposure
+
+You may request a 30‑minute consultation to review this snapshot and discuss next steps.
 Contact: {{contact}}
+
+This report is confidential and intended solely for the recipient listed above.
 """
 
 CHECKLIST_ITEMS = {
@@ -218,6 +272,236 @@ def _read_text(path: Path, default: str = "") -> str:
         return Path(path).read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return default
+
+def _load_config() -> dict:
+    try:
+        if CONFIG_FILE.exists():
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        pass
+    return {}
+
+def _save_config(cfg: dict) -> None:
+    try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = json.dumps(cfg or {}, indent=2)
+        CONFIG_FILE.write_text(tmp, encoding="utf-8")
+    except Exception:
+        logger.exception("Failed to save config at %s", CONFIG_FILE)
+
+def _get_openai_api_key(interactive: bool = True) -> str:
+    env_key = os.getenv("OPENAI_API_KEY")
+    if env_key:
+        return env_key.strip()
+    cfg = _load_config()
+    if cfg.get("openai_api_key"):
+        return str(cfg["openai_api_key"]).strip()
+    if not interactive:
+        return ""
+    print("[!] OpenAI API key is required for AI-assisted reporting.")
+    key = getpass.getpass("[+] Enter OpenAI API key (starts with 'sk-'): ").strip()
+    if key:
+        cfg["openai_api_key"] = key
+        _save_config(cfg)
+    return key
+
+def _extract_json_block(text: str) -> dict:
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    try:
+        import re as _re
+        m = _re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text)
+        if m:
+            return json.loads(m.group(1))
+        m = _re.search(r"(\{[\s\S]*\})", text)
+        if m:
+            return json.loads(m.group(1))
+    except Exception:
+        pass
+    return {}
+
+def ai_assist(case_dir, state):
+    try:
+        if not yes_no("Enable AI assistance (OpenAI) to prefill report fields?"):
+            return
+    except Exception:
+        return
+    api_key = _get_openai_api_key(interactive=True)
+    if not api_key:
+        logger.warning("No OpenAI API key provided; skipping AI assistance")
+        return
+
+    recon_dir = case_dir / "recon"
+    whois_txt = _read_text(recon_dir / "whois.txt")
+    dns_txt = _read_text(recon_dir / "dns.txt")
+    headers_txt = _read_text(recon_dir / "headers.txt")
+    robots_txt = _read_text(recon_dir / "robots.txt")
+    whatweb_txt = _read_text(recon_dir / "whatweb.txt")
+    subdomains_txt = _read_text(recon_dir / "subdomains.txt")
+    crtsh_txt = _read_text(recon_dir / "crtsh.txt")
+    ssl_labs_txt = _read_text(recon_dir / "ssl_labs.txt")
+    shodan_txt = _read_text(recon_dir / "shodan.txt")
+
+    sys_prompt = (
+        "You are a security analyst. Read passive recon artifacts and suggest: "
+        "area risk levels (Low/Med/High) for Domain/DNS, Tech Stack, Email/Creds, SSL, Sec Headers; "
+        "a Key Observations section in the provided business template style (3–5 items); "
+        "and an overall exposure score 0–100. Output ONLY JSON with keys: "
+        "area_ratings (object with keys: domain_dns, tech_stack, email_creds, ssl, sec_headers), "
+        "observations_md (string, markdown list formatted per template), suggested_score (int)."
+    )
+    user_payload = {
+        "business_name": state.get("business_name", ""),
+        "domain": state.get("domain", ""),
+        "artifacts": {
+            "whois": whois_txt,
+            "dns": dns_txt,
+            "headers": headers_txt,
+            "robots": robots_txt,
+            "whatweb": whatweb_txt,
+            "subdomains": subdomains_txt,
+            "crtsh": crtsh_txt,
+            "ssl_labs": ssl_labs_txt,
+            "shodan": shodan_txt,
+        },
+    }
+    prompt_text = json.dumps(user_payload)
+
+    suggestion = {}
+    try:
+        models = ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"]
+        if _OpenAIClient is not None:
+            client = _OpenAIClient(api_key=api_key)
+            for m in models:
+                try:
+                    resp = client.chat.completions.create(
+                        model=m,
+                        messages=[
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": prompt_text},
+                        ],
+                        temperature=0.2,
+                    )
+                    text = resp.choices[0].message.content
+                    suggestion = _extract_json_block(text)
+                    if suggestion:
+                        break
+                except Exception:
+                    continue
+        elif _openai_mod is not None:
+            _openai_mod.api_key = api_key
+            for m in models:
+                try:
+                    resp = _openai_mod.ChatCompletion.create(
+                        model=m,
+                        messages=[
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": prompt_text},
+                        ],
+                        temperature=0.2,
+                    )
+                    text = resp["choices"][0]["message"]["content"]
+                    suggestion = _extract_json_block(text)
+                    if suggestion:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        logger.exception("OpenAI request failed")
+        return
+
+    if not suggestion:
+        logger.warning("AI returned no suggestions")
+        return
+
+    area = suggestion.get("area_ratings") or {}
+    obs_md = suggestion.get("observations_md") or ""
+    try:
+        ai_score = int(suggestion.get("suggested_score"))
+    except Exception:
+        ai_score = None
+
+    state.setdefault("ai", {})
+    state["ai"]["area_ratings"] = area
+    state["ai"]["observations_md"] = obs_md
+    if ai_score is not None:
+        state["ai"]["suggested_score"] = ai_score
+    # Pre-fill if not set
+    state.setdefault("area_ratings", area or {})
+    if not state.get("observations_md") and obs_md:
+        state["observations_md"] = obs_md
+    logger.debug("ai_assist(): suggestions applied (area ratings=%s, suggested_score=%s)", area, ai_score)
+
+def _compute_overall_rating(score: int) -> str:
+    try:
+        s = int(score)
+    except Exception:
+        s = 0
+    if s <= 24:
+        return "Low"
+    if s <= 49:
+        return "Moderate"
+    if s <= 74:
+        return "Elevated"
+    return "High"
+
+def _prompt_choice(msg: str, choices: list, default: str) -> str:
+    canon = {c.lower(): c for c in choices}
+    synonyms = {
+        "low": "Low",
+        "l": "Low",
+        "med": "Med",
+        "m": "Med",
+        "medium": "Med",
+        "moderate": "Med",
+        "high": "High",
+        "h": "High",
+    }
+    prompt_text = f"{msg} [{'/'.join(choices)}] (default {default})"
+    while True:
+        val = prompt(prompt_text)
+        if not val:
+            return default
+        key = val.strip().lower()
+        if key in canon:
+            return canon[key]
+        if key in synonyms:
+            return synonyms[key]
+        logger.warning("Invalid choice. Please enter one of: %s", ", ".join(choices))
+
+def report_inputs(case_dir, state):
+    logger.debug("Starting report_inputs step")
+    prepared_by = prompt("Prepared by (your name/business)")
+    contact = prompt("Contact (email / phone)")
+
+    prev = state.get("area_ratings", {})
+    ratings = {}
+    ratings["domain_dns"] = _prompt_choice("Domain & DNS risk", ["Low", "Med", "High"], prev.get("domain_dns", "Low"))
+    ratings["tech_stack"] = _prompt_choice("Website Technology Stack risk", ["Low", "Med", "High"], prev.get("tech_stack", "Low"))
+    ratings["email_creds"] = _prompt_choice("Email & Credential Exposure risk", ["Low", "Med", "High"], prev.get("email_creds", "Low"))
+    ratings["ssl"] = _prompt_choice("SSL / Transport Security risk", ["Low", "Med", "High"], prev.get("ssl", "Low"))
+    ratings["sec_headers"] = _prompt_choice("Security Headers risk", ["Low", "Med", "High"], prev.get("sec_headers", "Low"))
+
+    existing_obs = state.get("observations_md") or ""
+    use_existing = False
+    if existing_obs:
+        try:
+            use_existing = yes_no("Use existing Key Observations (from AI/manual)?")
+        except Exception:
+            use_existing = True
+    observations_md = existing_obs if use_existing else prompt_multiline("Paste Key Observations section (optional) using the provided structure", end_marker="END")
+    if not observations_md and existing_obs:
+        observations_md = existing_obs
+
+    state["prepared_by"] = prepared_by or state.get("prepared_by", "Your Business Name")
+    state["contact"] = contact or state.get("contact", "you@company.com")
+    state["area_ratings"] = ratings
+    state["observations_md"] = observations_md
+    logger.debug("report_inputs(): collected prepared_by, contact, area ratings, and observations")
 
 # =========================
 # CASE INITIALIZATION
@@ -386,7 +670,20 @@ def upload_screenshots(case_dir, state):
 def risk_scoring(case_dir, state):
     logger.debug("Starting risk_scoring step")
     # CHECKLIST: risk_score
-    score = _prompt_int_in_range("Enter overall exposure score (0–100)")
+    suggested = None
+    try:
+        suggested = int(state.get("ai", {}).get("suggested_score"))
+    except Exception:
+        suggested = None
+    if suggested is not None:
+        raw = prompt(f"Enter overall exposure score (0–100) [suggested {suggested}]")
+        if raw == "":
+            score = suggested
+        else:
+            val = _extract_score(raw, 0, 100)
+            score = val if val is not None else _prompt_int_in_range("Enter overall exposure score (0–100)")
+    else:
+        score = _prompt_int_in_range("Enter overall exposure score (0–100)")
     state["risk_score"] = score
     state["checklist"]["risk_score"] = True
     logger.debug("risk_scoring(): set risk_score=%s", score)
@@ -430,20 +727,28 @@ def generate_report(case_dir, state):
         f"- {ck_mark('report_generated')} Report Generated",
     ])
 
-    # Build base report
+    # Build base report (fill placeholders per new template)
     report = REPORT_TEMPLATE
+    prepared_by = state.get("prepared_by", "Your Business Name")
+    contact = state.get("contact", "you@company.com")
+    score = int(state.get("risk_score", 0) or 0)
+    overall_rating = state.get("overall_rating") or _compute_overall_rating(score)
+    area = state.get("area_ratings", {})
+
     replacements = {
-        "{{business_name}}": state["business_name"],
-        "{{domain}}": state["domain"],
-        "{{date}}": state["date"],
-        "{{prepared_by}}": "Your Business Name",
-        "{{exposure_rating}}": "Moderate",
-        "{{exposure_score}}": str(state["risk_score"]),
-        "{{summary}}": "Passive exposure indicators were identified.",
-        "{{exposure_table}}": checklist_md,
-        "{{key_observations}}": "See recon artifacts and notes below.",
-        "{{recommendations}}": "Authorized active assessment recommended.",
-        "{{contact}}": "you@company.com"
+        "{{Business Name}}": state.get("business_name", ""),
+        "{{domain}}": state.get("domain", ""),
+        "{{date}}": state.get("date", ""),
+        "{{Your Business Name}}": prepared_by,
+        "{{Overall Exposure Rating}}": overall_rating,
+        "{{Overall Exposure Score}}": f"{score} / 100",
+        "{{Area_Domain_DNS}}": area.get("domain_dns", "Low"),
+        "{{Area_Tech_Stack}}": area.get("tech_stack", "Low"),
+        "{{Area_Email_Creds}}": area.get("email_creds", "Low"),
+        "{{Area_SSL}}": area.get("ssl", "Low"),
+        "{{Area_Sec_Headers}}": area.get("sec_headers", "Low"),
+        "{{contact}}": contact,
+        "{{observations_section}}": (state.get("observations_md") or "(none provided)")
     }
     for k, v in replacements.items():
         report = report.replace(k, v)
@@ -455,19 +760,27 @@ def generate_report(case_dir, state):
             body = "(no data)"
         return f"\n\n## {title}\n\n```\n{body}\n```\n"
 
-    report += section("WHOIS", whois_txt)
-    report += section("DNS (dig)", dns_txt)
-    report += section("HTTP Headers", headers_txt)
-    report += section("robots.txt", robots_txt)
-    report += section("WhatWeb", whatweb_txt)
-    report += section("Subdomains (subfinder)", subdomains_txt)
-    report += section("crt.sh", crtsh_txt)
-    report += section("SSL Labs (manual notes)", ssl_labs_txt)
-    report += section("Shodan (manual notes)", shodan_txt)
+    # Append appendices for artifacts and logs
+    def subsection(title, body):
+        body = body.strip() or "(no data)"
+        return f"\n\n### {title}\n\n```\n{body}\n```\n"
 
-    # Execution log
+    appendix = "\n\n## Appendix A: Recon Artifacts\n"
+    appendix += subsection("WHOIS", whois_txt)
+    appendix += subsection("DNS (dig)", dns_txt)
+    appendix += subsection("HTTP Headers", headers_txt)
+    appendix += subsection("robots.txt", robots_txt)
+    appendix += subsection("WhatWeb", whatweb_txt)
+    appendix += subsection("Subdomains (subfinder)", subdomains_txt)
+    appendix += subsection("crt.sh", crtsh_txt)
+    appendix += subsection("SSL Labs (manual notes)", ssl_labs_txt)
+    appendix += subsection("Shodan (manual notes)", shodan_txt)
+
     logs = "\n".join(getattr(_log_memory_handler, "records", []))
-    report += section("Run Log", logs)
+    appendix += "\n\n## Appendix B: Run Log\n"
+    appendix += subsection("Run Log", logs)
+
+    report += appendix
 
     # Write to case directory (existing behavior)
     md_path_case = case_dir / "reports" / "report.md"
@@ -547,6 +860,16 @@ def main():
     logger.debug("main(): upload_screenshots() start")
     upload_screenshots(case_dir, state)
     logger.debug("main(): upload_screenshots() complete")
+
+    # Step: AI assistance (uses recon + manual notes to prefill fields)
+    logger.debug("main(): ai_assist() start")
+    ai_assist(case_dir, state)
+    logger.debug("main(): ai_assist() complete")
+
+    # Step: Collect report inputs (prepared_by, contact, area ratings, observations)
+    logger.debug("main(): report_inputs() start")
+    report_inputs(case_dir, state)
+    logger.debug("main(): report_inputs() complete")
 
     # === Risk & Report ===
     logger.debug("main(): risk_scoring() start")
