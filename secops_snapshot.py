@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 import getpass
 import socket
 import ssl
+import io
 try:
     from openai import OpenAI as _OpenAIClient  # New-style client
 except Exception:  # pragma: no cover
@@ -32,6 +33,22 @@ try:
     import openai as _openai_mod  # Legacy client
 except Exception:  # pragma: no cover
     _openai_mod = None
+
+# Google APIs (optional)
+try:
+    from googleapiclient.discovery import build as _gbuild
+    from googleapiclient.http import MediaFileUpload as _MediaFileUpload
+    from googleapiclient.http import MediaIoBaseUpload as _MediaIoBaseUpload
+    from google_auth_oauthlib.flow import InstalledAppFlow as _InstalledAppFlow
+    from google.oauth2.credentials import Credentials as _GoogleCredentials
+    from google.auth.transport.requests import Request as _GoogleRequest
+except Exception:  # pragma: no cover
+    _gbuild = None
+    _MediaFileUpload = None
+    _MediaIoBaseUpload = None
+    _InstalledAppFlow = None
+    _GoogleCredentials = None
+    _GoogleRequest = None
 
 import logging
 
@@ -64,6 +81,14 @@ logger.addHandler(_log_memory_handler)
 BASE_DIR = Path.home() / "secops"
 CLIENTS_DIR = BASE_DIR / "clients"
 CONFIG_FILE = BASE_DIR / "config.json"
+
+# Google integration settings
+GOOGLE_SCOPES = [
+    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/documents',
+    'https://www.googleapis.com/auth/spreadsheets',
+]
+GOOGLE_TOKEN_FILE = BASE_DIR / "google_token.json"
 
 REPORT_TEMPLATE = """
 # Passive Security Exposure Snapshot
@@ -283,6 +308,55 @@ def _load_config() -> dict:
         pass
     return {}
 
+def _get_prepared_by(interactive: bool = True) -> str:
+    cfg = _load_config()
+    val = (cfg.get("prepared_by") or "").strip()
+    if val:
+        return val
+    if not interactive:
+        return "Your Business Name"
+    try:
+        v = prompt("Prepared by (your org/brand name)")
+        v = (v or "Your Business Name").strip()
+        cfg["prepared_by"] = v
+        _save_config(cfg)
+        return v
+    except Exception:
+        return "Your Business Name"
+
+def _get_contact_for(domain: str) -> str:
+    cfg = _load_config()
+    contacts = cfg.get("contacts") or {}
+    return (contacts.get(_normalize_domain(domain)) or "").strip()
+
+def _remember_contact(domain: str, email: str) -> None:
+    if not domain or not email:
+        return
+    try:
+        cfg = _load_config()
+        contacts = cfg.get("contacts") or {}
+        contacts[_normalize_domain(domain)] = email.strip()
+        cfg["contacts"] = contacts
+        _save_config(cfg)
+    except Exception:
+        logger.exception("Failed to persist contact mapping for %s", domain)
+
+def _get_default_contact(interactive: bool = True) -> str:
+    cfg = _load_config()
+    val = (cfg.get("default_contact") or "").strip()
+    if val:
+        return val
+    if not interactive:
+        return "you@company.com"
+    try:
+        v = prompt("Default contact email (used in reports)")
+        v = (v or "you@company.com").strip()
+        cfg["default_contact"] = v
+        _save_config(cfg)
+        return v
+    except Exception:
+        return "you@company.com"
+
 def _save_config(cfg: dict) -> None:
     try:
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -349,6 +423,12 @@ def ai_assist(case_dir, state):
         return
 
     recon_dir = case_dir / "recon"
+    # Ensure report identity fields are set before composing AI prompt
+    try:
+        state.setdefault("prepared_by", _get_prepared_by(interactive=False))
+        state.setdefault("contact", _get_default_contact(interactive=False))
+    except Exception:
+        pass
     whois_txt = _read_text(recon_dir / "whois.txt")
     dns_txt = _read_text(recon_dir / "dns.txt")
     headers_txt = _read_text(recon_dir / "headers.txt")
@@ -501,8 +581,8 @@ def _prompt_choice(msg: str, choices: list, default: str) -> str:
 
 def report_inputs(case_dir, state):
     logger.debug("Starting report_inputs step")
-    prepared_by = state.get("prepared_by", "Your Business Name")
-    contact = state.get("contact", "you@company.com")
+    prepared_by = state.get("prepared_by") or _get_prepared_by(interactive=False)
+    contact = state.get("contact") or _get_default_contact(interactive=False)
     area = state.get("ai", {}).get("area_ratings") or state.get("area_ratings") or {}
     ratings = {
         "domain_dns": area.get("domain_dns", "Medium"),
@@ -519,6 +599,312 @@ def report_inputs(case_dir, state):
         state["observations_md"] = observations_md
     logger.debug("report_inputs(): auto-populated without prompts")
 
+# =========================
+# GOOGLE INTEGRATIONS (optional)
+# =========================
+
+def _get_google_credentials():
+    if _InstalledAppFlow is None or _GoogleCredentials is None or _GoogleRequest is None:
+        logger.warning("Google API libraries not installed; skipping Google integration")
+        return None
+    cfg = _load_config()
+    if GOOGLE_TOKEN_FILE.exists():
+        try:
+            creds = _GoogleCredentials.from_authorized_user_file(str(GOOGLE_TOKEN_FILE), GOOGLE_SCOPES)
+        except Exception:
+            creds = None
+    else:
+        creds = None
+    if creds and creds.valid:
+        return creds
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(_GoogleRequest())
+            GOOGLE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            GOOGLE_TOKEN_FILE.write_text(creds.to_json())
+            return creds
+        except Exception:
+            logger.exception("Failed to refresh Google credentials; will re-auth")
+    client_path = cfg.get("google_client_secret_path")
+    if not client_path or not Path(client_path).exists():
+        print("[!] Google OAuth client secrets JSON is required (download from Google Cloud Console)")
+        p = prompt("Path to client_secret.json")
+        if p:
+            p = str(Path(p).expanduser())
+            if Path(p).exists():
+                cfg["google_client_secret_path"] = p
+                _save_config(cfg)
+                client_path = p
+    if not client_path or not Path(client_path).exists():
+        logger.warning("No Google client secrets provided; skipping Google integration")
+        return None
+    try:
+        flow = _InstalledAppFlow.from_client_secrets_file(client_path, GOOGLE_SCOPES)
+        creds = flow.run_local_server(port=0)
+        GOOGLE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        GOOGLE_TOKEN_FILE.write_text(creds.to_json())
+        return creds
+    except Exception:
+        logger.exception("Google OAuth failed")
+        return None
+
+def _get_google_services():
+    if _gbuild is None:
+        return None, None, None
+    creds = _get_google_credentials()
+    if not creds:
+        return None, None, None
+    try:
+        drive = _gbuild('drive', 'v3', credentials=creds)
+        docs = _gbuild('docs', 'v1', credentials=creds)
+        sheets = _gbuild('sheets', 'v4', credentials=creds)
+        return drive, docs, sheets
+    except Exception:
+        logger.exception("Failed to build Google API services")
+        return None, None, None
+
+def _drive_ensure_folder(drive, name, parent_id=None):
+    try:
+        q = f"name = '{name.replace("'", "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        if parent_id:
+            q += f" and '{parent_id}' in parents"
+        res = drive.files().list(q=q, spaces='drive', fields='files(id, name, parents)').execute()
+        items = res.get('files', [])
+        if items:
+            return items[0]['id']
+        meta = {'name': name, 'mimeType': 'application/vnd.google-apps.folder'}
+        if parent_id:
+            meta['parents'] = [parent_id]
+        folder = drive.files().create(body=meta, fields='id').execute()
+        return folder['id']
+    except Exception:
+        logger.exception("drive ensure folder failed")
+        return None
+
+def _drive_get_or_create_clients_root(drive):
+    cfg = _load_config()
+    root_name = cfg.get('drive_clients_root_name') or 'Clients'
+    return _drive_ensure_folder(drive, root_name)
+
+def _drive_find_child_by_name(drive, parent_id, name):
+    try:
+        q = f"name = '{name.replace("'", "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and '{parent_id}' in parents"
+        res = drive.files().list(q=q, spaces='drive', fields='files(id, name)').execute()
+        items = res.get('files', [])
+        return items[0]['id'] if items else None
+    except Exception:
+        logger.exception("drive find child failed")
+        return None
+
+def _drive_get_or_create_client_folder(drive, clients_root_id, domain, business_name, mapping: dict):
+    # Priority: mapping override -> exact business -> title-cased business -> domain -> domain base
+    candidates = []
+    if mapping and domain in mapping:
+        candidates.append(mapping[domain])
+    if business_name:
+        candidates.append(business_name)
+        candidates.append(str(business_name).title())
+    if domain:
+        candidates.append(domain)
+        base = domain.split(".")[0]
+        candidates.append(base)
+        candidates.append(base.title())
+    seen = set()
+    for name in candidates:
+        name = (name or "").strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        fid = _drive_find_child_by_name(drive, clients_root_id, name)
+        if fid:
+            return fid, name
+    # Not found: create using best candidate
+    target = None
+    for n in candidates:
+        if n and n.strip():
+            target = n.strip()
+            break
+    target = target or (business_name or domain or "Client")
+    fid = _drive_ensure_folder(drive, target, parent_id=clients_root_id)
+    return fid, target
+
+def _docs_create_in_folder(docs, drive, folder_id, title, text_content):
+    try:
+        doc = docs.documents().create(body={'title': title}).execute()
+        doc_id = doc.get('documentId')
+        try:
+            drive.files().update(fileId=doc_id, addParents=folder_id, fields='id, parents').execute()
+        except Exception:
+            pass
+        try:
+            docs.documents().batchUpdate(documentId=doc_id, body={
+                'requests': [
+                    {'insertText': {'location': {'index': 1}, 'text': text_content}}
+                ]
+            }).execute()
+        except Exception:
+            logger.exception("docs insert text failed")
+        return doc_id
+    except Exception:
+        logger.exception("docs create failed")
+        return None
+
+def _drive_upload_pdf_bytes(drive, folder_id, name, data: bytes):
+    try:
+        media = _MediaIoBaseUpload(io.BytesIO(data), mimetype='application/pdf', resumable=False)
+        file = drive.files().create(body={'name': name, 'parents': [folder_id]}, media_body=media, fields='id').execute()
+        return file.get('id')
+    except Exception:
+        logger.exception("drive pdf upload failed")
+        return None
+
+def _docs_export_pdf_and_upload(drive, doc_id, folder_id, pdf_name):
+    try:
+        data = drive.files().export(fileId=doc_id, mimeType='application/pdf').execute()
+        if isinstance(data, bytes):
+            pdf_bytes = data
+        else:
+            pdf_bytes = data if hasattr(data, 'decode') else bytes(data)
+        return _drive_upload_pdf_bytes(drive, folder_id, pdf_name, pdf_bytes)
+    except Exception:
+        logger.exception("export pdf failed")
+        return None
+
+def _col_letter(idx_zero_based):
+    n = idx_zero_based + 1
+    s = ''
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def process_batch_from_google_sheet():
+    drive, docs, sheets = _get_google_services()
+    if not drive or not docs or not sheets:
+        logger.warning("Google services unavailable; aborting batch mode")
+        return
+    cfg = _load_config()
+    sheet_id = cfg.get("google_sheet_id")
+    sheet_name = cfg.get("google_sheet_name")
+    # Ensure prepared_by and default contact are stored once
+    _ = _get_prepared_by(interactive=True)
+    _ = _get_default_contact(interactive=True)
+    if not sheet_id:
+        sheet_id = prompt("Google Sheet ID")
+        cfg["google_sheet_id"] = sheet_id
+        _save_config(cfg)
+    if not sheet_name:
+        sheet_name = prompt("Sheet name (tab)")
+        cfg["google_sheet_name"] = sheet_name
+        _save_config(cfg)
+    clients_root_id = _drive_get_or_create_clients_root(drive)
+    try:
+        resp = sheets.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{sheet_name}!A:Z").execute()
+        rows = resp.get('values', [])
+    except Exception:
+        logger.exception("Failed to read Google Sheet")
+        return
+    if not rows:
+        logger.warning("Sheet has no rows")
+        return
+    header = [c.strip() for c in rows[0]]
+    cols = {name.lower(): i for i, name in enumerate(header)}
+    req_cols = ['website', 'e-mail', 'report generated', 'emailed']
+    for rc in req_cols:
+        if rc not in cols:
+            logger.warning("Missing required column: %s", rc)
+            return
+    website_idx = cols['website']
+    email_idx = cols['e-mail']
+    gen_idx = cols['report generated']
+    for r_idx in range(1, len(rows)):
+        row = rows[r_idx]
+        def get(i):
+            return row[i].strip() if i < len(row) and row[i] else ''
+        website = get(website_idx)
+        email = get(email_idx)  # Not persisted; reserved for future emailing feature
+        gen = get(gen_idx).lower()
+        if not website:
+            continue
+        if gen == 'y':
+            continue
+        domain = _normalize_domain(website)
+        # Resolve display business name from config mapping (fallback to domain)
+        cfg_names = (_load_config().get('business_names') or {})
+        business = cfg_names.get(domain) or domain
+        client = _safe_slug(domain)
+        case_dir, state = init_case_with_inputs(client, domain, business)
+        # Do not persist or rely on per-row email; use user's default contact for reports
+        state['contact'] = state.get('contact') or _get_default_contact(interactive=False)
+        prepared_by = _get_prepared_by(interactive=False)
+        state['prepared_by'] = prepared_by
+        whois_lookup(case_dir, state)
+        dns_lookup(case_dir, state)
+        headers_check(case_dir, state)
+        robots_check(case_dir, state)
+        whatweb_scan(case_dir, state)
+        subdomain_enum(case_dir, state)
+        crtsh_lookup(case_dir, state)
+        ssl_tls_probe(case_dir, state)
+        shodan_lookup(case_dir, state)
+        ai_assist(case_dir, state)
+        report_inputs(case_dir, state)
+        risk_scoring(case_dir, state)
+        generate_report(case_dir, state)
+        try:
+            with open(case_dir / 'reports' / 'report.md', 'r', encoding='utf-8', errors='ignore') as f:
+                report_text = f.read()
+        except Exception:
+            report_text = ''
+        # Resolve folder under Clients root; try to match existing folders, then create if needed
+        cfg = _load_config()
+        mapping = (cfg.get('drive_folder_names') or {})
+        folder_id, folder_name = _drive_get_or_create_client_folder(
+            drive, clients_root_id, domain, state.get('business_name'), mapping
+        )
+        if folder_id:
+            title = f"{folder_name} Passive Security Exposure Snapshot"
+            doc_id = _docs_create_in_folder(docs, drive, folder_id, title, report_text)
+            if doc_id:
+                _docs_export_pdf_and_upload(drive, doc_id, folder_id, f"{folder_name}.pdf")
+        try:
+            col_letter = _col_letter(gen_idx)
+            cell_range = f"{sheet_name}!{col_letter}{r_idx+1}"
+            sheets.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=cell_range,
+                valueInputOption='RAW',
+                body={'values': [[ 'y' ]]}
+            ).execute()
+        except Exception:
+            logger.exception("Failed to update Report Generated for row %s", r_idx+1)
+
+def init_case_with_inputs(client: str, domain: str, business: str):
+    logger.debug("init_case_with_inputs(): starting")
+    norm_domain = _normalize_domain(domain)
+    safe_client = _safe_slug(client)
+    case_dir = CLIENTS_DIR / safe_client
+    for d in ["scope", "recon", "scans", "evidence", "reports", "notes"]:
+        (case_dir / d).mkdir(parents=True, exist_ok=True)
+    scope_file = case_dir / "scope" / "scope.txt"
+    scope_file.write_text(
+        f"Domain: {domain}\n"
+        "Scope: Passive analysis only\n"
+        "No authentication, exploitation, or active scanning\n"
+    )
+    state = {
+        "client": client,
+        "business_name": business,
+        "domain": norm_domain,
+        "date": str(datetime.date.today()),
+        "checklist": CHECKLIST_ITEMS.copy(),
+        "findings": [],
+        "risk_score": 0
+    }
+    with open(case_dir / "notes" / "state.json", "w") as f:
+        json.dump(state, f, indent=2)
+    logger.debug("init_case_with_inputs(): initialized (client=%s, domain=%s)", client, norm_domain)
+    return case_dir, state
 # =========================
 # CASE INITIALIZATION
 # CHECKLIST: (none)
@@ -929,6 +1315,19 @@ def generate_report(case_dir, state):
 
 def main():
     logger.debug("Entering main()")
+    try:
+        if _gbuild is not None and yes_no("Process all pending sites from Google Sheet now?"):
+            process_batch_from_google_sheet()
+            print("[+] Batch processing complete")
+            return
+    except Exception:
+        logger.exception("Batch mode prompt failed; continuing with single-case flow")
+    # Ensure one-time setup for prepared_by and default contact in single-case flow
+    try:
+        _ = _get_prepared_by(interactive=True)
+        _ = _get_default_contact(interactive=True)
+    except Exception:
+        logger.exception("One-time prepared_by/default_contact setup failed; continuing")
     case_dir, state = init_case()
 
     # === Automated Passive Recon ===
