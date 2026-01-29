@@ -628,27 +628,49 @@ def _get_google_credentials():
         except Exception:
             logger.exception("Failed to refresh Google credentials; will re-auth")
     client_path = cfg.get("google_client_secret_path")
-    if not client_path or not Path(client_path).exists():
+    # Validate existing path or re-prompt until a valid file is provided (blank to abort)
+    attempts = 0
+    while True:
+        if client_path and Path(client_path).is_file():
+            break
         print("[!] Google OAuth client secrets JSON is required (download from Google Cloud Console)")
-        p = prompt("Path to client_secret.json")
-        if p:
-            p = str(Path(p).expanduser())
-            if Path(p).exists():
-                cfg["google_client_secret_path"] = p
-                _save_config(cfg)
-                client_path = p
-    if not client_path or not Path(client_path).exists():
-        logger.warning("No Google client secrets provided; skipping Google integration")
-        return None
+        if client_path and Path(client_path).exists() and Path(client_path).is_dir():
+            print("[!] The path you provided is a directory. Please provide the full path to the JSON file (e.g., /path/client_secret.json).")
+        p = prompt("Path to client_secret.json (leave blank to skip)")
+        p = (p or "").strip()
+        if not p:
+            logger.warning("No Google client secrets provided; skipping Google integration")
+            return None
+        p = str(Path(p).expanduser())
+        if not Path(p).is_file():
+            print("[!] That path is not a file or does not exist. Try again.")
+            client_path = p
+            attempts += 1
+            if attempts >= 3:
+                logger.warning("Max attempts reached for client_secret.json path; skipping Google integration")
+                return None
+            continue
+        cfg["google_client_secret_path"] = p
+        _save_config(cfg)
+        client_path = p
+    # Attempt OAuth flow; if directory/file errors occur, re-prompt once
     try:
         flow = _InstalledAppFlow.from_client_secrets_file(client_path, GOOGLE_SCOPES)
         creds = flow.run_local_server(port=0)
         GOOGLE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         GOOGLE_TOKEN_FILE.write_text(creds.to_json())
         return creds
+    except IsADirectoryError:
+        print("[!] Provided path is a directory. Please provide the full JSON file path.")
+    except FileNotFoundError:
+        print("[!] Provided client_secret.json path not found. Please provide a valid file path.")
     except Exception:
         logger.exception("Google OAuth failed")
         return None
+    # Re-prompt once more after specific errors
+    cfg["google_client_secret_path"] = ""
+    _save_config(cfg)
+    return _get_google_credentials()
 
 def _get_google_services():
     if _gbuild is None:
@@ -673,15 +695,23 @@ def setup_google_integration_interactive():
         return
     cfg = _load_config()
     path = cfg.get("google_client_secret_path")
-    if not path or not Path(path).exists():
-        p = prompt("Path to Google OAuth client_secret.json")
-        if p:
+    if not path or not Path(path).is_file():
+        # Loop until a valid file is provided or user skips
+        while True:
+            p = prompt("Path to Google OAuth client_secret.json (leave blank to skip)")
+            p = (p or "").strip()
+            if not p:
+                break
             p = str(Path(p).expanduser())
-            if Path(p).exists():
+            if Path(p).is_file():
                 cfg["google_client_secret_path"] = p
                 _save_config(cfg)
+                path = p
+                break
+            if Path(p).exists() and Path(p).is_dir():
+                print("[!] That path is a directory. Provide the full JSON file path.")
             else:
-                print("[!] Provided path does not exist; you can run setup again later")
+                print("[!] Provided path does not exist or is not a file. Try again.")
     # Trigger OAuth flow now so future runs are seamless
     d, dc, sh = _get_google_services()
     if not d or not dc or not sh:
@@ -711,7 +741,7 @@ def _google_config_ready():
         return False
     cfg = _load_config()
     p = cfg.get("google_client_secret_path")
-    return bool(p and Path(p).exists() and GOOGLE_TOKEN_FILE.exists())
+    return bool(p and Path(p).is_file() and GOOGLE_TOKEN_FILE.exists())
 
 def _drive_ensure_folder(drive, name, parent_id=None):
     try:
