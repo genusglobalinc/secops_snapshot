@@ -383,21 +383,52 @@ def _get_openai_api_key(interactive: bool = True) -> str:
         _save_config(cfg)
     return key
 
-def _get_shodan_api_key(interactive: bool = True) -> str:
+def _get_shodan_api_key(interactive: bool = True, validate: bool = False, attempts: int = 3) -> str:
     env_key = os.getenv("SHODAN_API_KEY")
-    if env_key:
-        return env_key.strip()
     cfg = _load_config()
-    if cfg.get("shodan_api_key"):
-        return str(cfg["shodan_api_key"]).strip()
+    key = (env_key or cfg.get("shodan_api_key") or "").strip()
+    def _store(k):
+        cfg["shodan_api_key"] = k
+        _save_config(cfg)
+    if key and validate:
+        if _validate_shodan_api_key_http(key):
+            return key
+        else:
+            print("[!] Saved Shodan API key appears invalid. Please re-enter.")
+            key = ""
+    if key:
+        return key
     if not interactive:
         return ""
-    print("[!] Shodan API key is required for Shodan CLI/API.")
-    key = getpass.getpass("[+] Enter Shodan API key: ").strip()
-    if key:
-        cfg["shodan_api_key"] = key
-        _save_config(cfg)
-    return key
+    tries = 0
+    while tries < attempts:
+        print("[!] Shodan API key is required for Shodan CLI/API.")
+        k = getpass.getpass("[+] Enter Shodan API key: ").strip()
+        if not k:
+            tries += 1
+            continue
+        if not validate or _validate_shodan_api_key_http(k):
+            _store(k)
+            return k
+        print("[!] Provided Shodan API key is invalid. Please try again.")
+        tries += 1
+    return ""
+
+def _validate_shodan_api_key_http(key: str) -> bool:
+    if not key:
+        return False
+    try:
+        url = f"https://api.shodan.io/api-info?key={quote_plus(key)}"
+        r = urllib.request.urlopen(url, timeout=15)
+        data = json.loads(r.read().decode("utf-8", "ignore"))
+        return isinstance(data, dict) and ("plan" in data or "query_credits" in data)
+    except Exception:
+        return False
+
+def _critical_exit(msg: str):
+    logger.error("CRITICAL: %s", msg)
+    print(f"[!] {msg}")
+    raise SystemExit(1)
 
 def _extract_json_block(text: str) -> dict:
     if not text:
@@ -1202,7 +1233,7 @@ def shodan_lookup(case_dir, state):
         if (not info) or info.returncode != 0:
             try:
                 if yes_no("Shodan CLI appears uninitialized. Initialize now?"):
-                    key = _get_shodan_api_key(interactive=True)
+                    key = _get_shodan_api_key(interactive=True, validate=True)
                     if key:
                         subprocess.run(["shodan", "init", key], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             except Exception:
@@ -1250,7 +1281,7 @@ def shodan_lookup(case_dir, state):
         except Exception:
             needs_http = True
         if needs_http:
-            key = _get_shodan_api_key(interactive=True)
+            key = _get_shodan_api_key(interactive=True, validate=True)
             if key:
                 with open(out, "a", encoding="utf-8", errors="ignore") as f:
                     f.write("\n\n===== shodan HTTP API search =====\n")
@@ -1279,8 +1310,50 @@ def shodan_lookup(case_dir, state):
                                 f.write(f"HTTP API host error for {ip}: {e}\n")
                     except Exception:
                         pass
+            else:
+                _critical_exit("Shodan API key missing or invalid; cannot continue.")
     except Exception:
         logger.exception("Error running Shodan CLI search")
+        key = _get_shodan_api_key(interactive=True, validate=True)
+        if not key:
+            _critical_exit("Shodan API key missing or invalid; cannot continue.")
+        try:
+            with open(out, "a", encoding="utf-8", errors="ignore") as f:
+                f.write("\n\n===== shodan HTTP API search =====\n")
+                try:
+                    url = f"https://api.shodan.io/shodan/host/search?key={key}&query={quote_plus(query)}"
+                    r = urllib.request.urlopen(url, timeout=30)
+                    f.write(r.read().decode("utf-8", "ignore"))
+                except Exception as e:
+                    f.write(f"HTTP API search error: {e}\n")
+                f.write("\n\n===== shodan HTTP API domain =====\n")
+                try:
+                    url = f"https://api.shodan.io/dns/domain/{state['domain']}?key={key}"
+                    r = urllib.request.urlopen(url, timeout=30)
+                    f.write(r.read().decode("utf-8", "ignore"))
+                except Exception as e:
+                    f.write(f"HTTP API domain error: {e}\n")
+                try:
+                    f.write("\n\n===== shodan HTTP API host (resolved IPs) =====\n")
+                    ips = set()
+                    for family in (socket.AF_INET, socket.AF_INET6):
+                        try:
+                            infos = socket.getaddrinfo(state["domain"], None, family, socket.SOCK_STREAM)
+                            for info in infos:
+                                ip = info[4][0]
+                                ips.add(ip)
+                        except Exception:
+                            continue
+                    for ip in sorted(ips):
+                        f.write(f"\n----- {ip} (HTTP API) -----\n")
+                        try:
+                            url = f"https://api.shodan.io/shodan/host/{ip}?key={key}"
+                            r = urllib.request.urlopen(url, timeout=30)
+                            f.write(r.read().decode("utf-8", "ignore"))
+                        except Exception as e:
+                            f.write(f"HTTP API host error for {ip}: {e}\n")
+                except Exception:
+                    pass
     state["checklist"]["shodan"] = True
     logger.debug("shodan_lookup(): wrote to %s", out)
 
