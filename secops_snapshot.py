@@ -20,7 +20,9 @@ import datetime
 import shutil
 from pathlib import Path
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
+import urllib.request
+import urllib.error
 import getpass
 import socket
 import ssl
@@ -663,6 +665,54 @@ def _get_google_services():
         logger.exception("Failed to build Google API services")
         return None, None, None
 
+def setup_google_integration_interactive():
+    logger.debug("setup_google_integration_interactive(): starting")
+    if _gbuild is None:
+        print("[!] Google API libraries are not installed.")
+        print("[i] Please install: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib")
+        return
+    cfg = _load_config()
+    path = cfg.get("google_client_secret_path")
+    if not path or not Path(path).exists():
+        p = prompt("Path to Google OAuth client_secret.json")
+        if p:
+            p = str(Path(p).expanduser())
+            if Path(p).exists():
+                cfg["google_client_secret_path"] = p
+                _save_config(cfg)
+            else:
+                print("[!] Provided path does not exist; you can run setup again later")
+    # Trigger OAuth flow now so future runs are seamless
+    d, dc, sh = _get_google_services()
+    if not d or not dc or not sh:
+        print("[!] Google authorization not completed; please check your client_secret.json and try again.")
+        return
+    # Ask for Drive clients root name
+    root_name = cfg.get('drive_clients_root_name') or 'Clients'
+    if yes_no(f"Use '{root_name}' as the Drive root folder for client deliverables?"):
+        cfg['drive_clients_root_name'] = root_name
+    else:
+        rn = prompt("Enter Drive root folder name (e.g., Clients)")
+        if rn:
+            cfg['drive_clients_root_name'] = rn.strip()
+    # Optionally store sheet id/name
+    if yes_no("Store Google Sheet ID and Sheet name for batch processing?"):
+        sid = prompt("Google Sheet ID")
+        sname = prompt("Sheet name (tab)")
+        if sid:
+            cfg['google_sheet_id'] = sid.strip()
+        if sname:
+            cfg['google_sheet_name'] = sname.strip()
+    _save_config(cfg)
+    print("[+] Google integrations configured")
+
+def _google_config_ready():
+    if _gbuild is None:
+        return False
+    cfg = _load_config()
+    p = cfg.get("google_client_secret_path")
+    return bool(p and Path(p).exists() and GOOGLE_TOKEN_FILE.exists())
+
 def _drive_ensure_folder(drive, name, parent_id=None):
     try:
         q = f"name = '{name.replace("'", "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -1003,7 +1053,8 @@ def whatweb_scan(case_dir, state):
     # CHECKLIST: tech_stack
     out = case_dir / "recon" / "whatweb.txt"
     logger.debug("whatweb_scan(): writing to %s", out)
-    run_cmd(f"whatweb -a 3 https://{state['domain']}", out, desc="whatweb")
+    timeout = int(os.getenv("SECOPS_TIMEOUT_WHATWEB", "240"))
+    run_cmd(f"whatweb -a 3 https://{state['domain']}", out, desc="whatweb", timeout=timeout)
     state["checklist"]["tech_stack"] = True
     logger.debug("whatweb_scan(): complete")
 
@@ -1012,7 +1063,8 @@ def subdomain_enum(case_dir, state):
     # CHECKLIST: subdomains
     out = case_dir / "recon" / "subdomains.txt"
     logger.debug("subdomain_enum(): writing to %s", out)
-    run_cmd(f"subfinder -d {state['domain']} -silent", out, desc="subfinder")
+    timeout = int(os.getenv("SECOPS_TIMEOUT_SUBFINDER", "300"))
+    run_cmd(f"subfinder -d {state['domain']} -silent", out, desc="subfinder", timeout=timeout)
     state["checklist"]["subdomains"] = True
     logger.debug("subdomain_enum(): complete")
 
@@ -1144,6 +1196,44 @@ def shodan_lookup(case_dir, state):
                     subprocess.run(["shodan", "host", ip], stdout=f, stderr=subprocess.STDOUT, text=True)
                 except Exception:
                     continue
+        # Fallback via HTTP API if CLI returned access denied or empty
+        needs_http = False
+        try:
+            content = _read_text(out)
+            if ("403 Forbidden" in content) or ("Access denied" in content) or (result.returncode not in (None, 0)):
+                needs_http = True
+        except Exception:
+            needs_http = True
+        if needs_http:
+            key = _get_shodan_api_key(interactive=True)
+            if key:
+                with open(out, "a", encoding="utf-8", errors="ignore") as f:
+                    f.write("\n\n===== shodan HTTP API search =====\n")
+                    try:
+                        url = f"https://api.shodan.io/shodan/host/search?key={key}&query={quote_plus(query)}"
+                        r = urllib.request.urlopen(url, timeout=30)
+                        f.write(r.read().decode("utf-8", "ignore"))
+                    except Exception as e:
+                        f.write(f"HTTP API search error: {e}\n")
+                    f.write("\n\n===== shodan HTTP API domain =====\n")
+                    try:
+                        url = f"https://api.shodan.io/dns/domain/{state['domain']}?key={key}"
+                        r = urllib.request.urlopen(url, timeout=30)
+                        f.write(r.read().decode("utf-8", "ignore"))
+                    except Exception as e:
+                        f.write(f"HTTP API domain error: {e}\n")
+                    # Host info per IP (reuse previously resolved ips)
+                    try:
+                        for ip in sorted(ips):
+                            f.write(f"\n----- {ip} (HTTP API) -----\n")
+                            try:
+                                url = f"https://api.shodan.io/shodan/host/{ip}?key={key}"
+                                r = urllib.request.urlopen(url, timeout=30)
+                                f.write(r.read().decode("utf-8", "ignore"))
+                            except Exception as e:
+                                f.write(f"HTTP API host error for {ip}: {e}\n")
+                    except Exception:
+                        pass
     except Exception:
         logger.exception("Error running Shodan CLI search")
     state["checklist"]["shodan"] = True
@@ -1315,6 +1405,19 @@ def generate_report(case_dir, state):
 
 def main():
     logger.debug("Entering main()")
+    # If Google not configured yet, trigger setup to ensure user sees OAuth prompts
+    try:
+        if _gbuild is not None and not _google_config_ready():
+            print("[i] Google integrations not configured; starting setup...")
+            setup_google_integration_interactive()
+    except Exception:
+        logger.exception("Auto Google setup failed; continuing")
+    # Offer to configure Google integrations up front so users see the OAuth/setup prompts
+    try:
+        if yes_no("Configure Google integrations (Drive/Docs/Sheets) now?"):
+            setup_google_integration_interactive()
+    except Exception:
+        logger.exception("Google setup prompt failed; continuing")
     try:
         if _gbuild is not None and yes_no("Process all pending sites from Google Sheet now?"):
             process_batch_from_google_sheet()
