@@ -22,6 +22,8 @@ from pathlib import Path
 import re
 from urllib.parse import urlparse
 import getpass
+import socket
+import ssl
 try:
     from openai import OpenAI as _OpenAIClient  # New-style client
 except Exception:  # pragma: no cover
@@ -305,6 +307,22 @@ def _get_openai_api_key(interactive: bool = True) -> str:
         _save_config(cfg)
     return key
 
+def _get_shodan_api_key(interactive: bool = True) -> str:
+    env_key = os.getenv("SHODAN_API_KEY")
+    if env_key:
+        return env_key.strip()
+    cfg = _load_config()
+    if cfg.get("shodan_api_key"):
+        return str(cfg["shodan_api_key"]).strip()
+    if not interactive:
+        return ""
+    print("[!] Shodan API key is required for Shodan CLI/API.")
+    key = getpass.getpass("[+] Enter Shodan API key: ").strip()
+    if key:
+        cfg["shodan_api_key"] = key
+        _save_config(cfg)
+    return key
+
 def _extract_json_block(text: str) -> dict:
     if not text:
         return {}
@@ -325,11 +343,6 @@ def _extract_json_block(text: str) -> dict:
     return {}
 
 def ai_assist(case_dir, state):
-    try:
-        if not yes_no("Enable AI assistance (OpenAI) to prefill report fields?"):
-            return
-    except Exception:
-        return
     api_key = _get_openai_api_key(interactive=True)
     if not api_key:
         logger.warning("No OpenAI API key provided; skipping AI assistance")
@@ -475,33 +488,23 @@ def _prompt_choice(msg: str, choices: list, default: str) -> str:
 
 def report_inputs(case_dir, state):
     logger.debug("Starting report_inputs step")
-    prepared_by = prompt("Prepared by (your name/business)")
-    contact = prompt("Contact (email / phone)")
-
-    prev = state.get("area_ratings", {})
-    ratings = {}
-    ratings["domain_dns"] = _prompt_choice("Domain & DNS risk", ["Low", "Med", "High"], prev.get("domain_dns", "Low"))
-    ratings["tech_stack"] = _prompt_choice("Website Technology Stack risk", ["Low", "Med", "High"], prev.get("tech_stack", "Low"))
-    ratings["email_creds"] = _prompt_choice("Email & Credential Exposure risk", ["Low", "Med", "High"], prev.get("email_creds", "Low"))
-    ratings["ssl"] = _prompt_choice("SSL / Transport Security risk", ["Low", "Med", "High"], prev.get("ssl", "Low"))
-    ratings["sec_headers"] = _prompt_choice("Security Headers risk", ["Low", "Med", "High"], prev.get("sec_headers", "Low"))
-
-    existing_obs = state.get("observations_md") or ""
-    use_existing = False
-    if existing_obs:
-        try:
-            use_existing = yes_no("Use existing Key Observations (from AI/manual)?")
-        except Exception:
-            use_existing = True
-    observations_md = existing_obs if use_existing else prompt_multiline("Paste Key Observations section (optional) using the provided structure", end_marker="END")
-    if not observations_md and existing_obs:
-        observations_md = existing_obs
-
-    state["prepared_by"] = prepared_by or state.get("prepared_by", "Your Business Name")
-    state["contact"] = contact or state.get("contact", "you@company.com")
+    prepared_by = state.get("prepared_by", "Your Business Name")
+    contact = state.get("contact", "you@company.com")
+    area = state.get("ai", {}).get("area_ratings") or state.get("area_ratings") or {}
+    ratings = {
+        "domain_dns": area.get("domain_dns", "Medium"),
+        "tech_stack": area.get("tech_stack", "Medium"),
+        "email_creds": area.get("email_creds", "Medium"),
+        "ssl": area.get("ssl", "Medium"),
+        "sec_headers": area.get("sec_headers", "Medium"),
+    }
+    observations_md = state.get("ai", {}).get("observations_md") or state.get("observations_md") or ""
+    state["prepared_by"] = prepared_by
+    state["contact"] = contact
     state["area_ratings"] = ratings
-    state["observations_md"] = observations_md
-    logger.debug("report_inputs(): collected prepared_by, contact, area ratings, and observations")
+    if observations_md:
+        state["observations_md"] = observations_md
+    logger.debug("report_inputs(): auto-populated without prompts")
 
 # =========================
 # CASE INITIALIZATION
@@ -511,9 +514,15 @@ def report_inputs(case_dir, state):
 
 def init_case():
     logger.debug("init_case(): starting")
-    client = prompt("Client short name (e.g. acme_corp)")
-    domain = prompt("Primary domain (example.com)")
-    business = prompt("Business legal name")
+    auto = os.getenv("SECOPS_AUTO") or os.getenv("SECOPS_NON_INTERACTIVE")
+    if auto:
+        client = os.getenv("SECOPS_CLIENT") or "client"
+        domain = os.getenv("SECOPS_DOMAIN") or "example.com"
+        business = os.getenv("SECOPS_BUSINESS") or client
+    else:
+        client = prompt("Client short name (e.g. acme_corp)")
+        domain = prompt("Primary domain (example.com)")
+        business = prompt("Business legal name")
 
     # Normalize inputs
     norm_domain = _normalize_domain(domain)
@@ -627,18 +636,52 @@ def crtsh_lookup(case_dir, state):
     logger.debug("crtsh_lookup(): complete")
 
 # =========================
-# MANUAL INPUT PHASE
+# MANUAL / OPTIONAL INPUT PHASE
 # =========================
+
+def ssl_tls_probe(case_dir, state):
+    logger.debug("Starting ssl_tls_probe step")
+    out = case_dir / "recon" / "ssl_labs.txt"
+    host = state["domain"]
+    lines = []
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, 443), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                try:
+                    ver = ssock.version() or ""
+                except Exception:
+                    ver = ""
+                try:
+                    cipher = ssock.cipher()
+                except Exception:
+                    cipher = None
+                try:
+                    cert = ssock.getpeercert()
+                except Exception:
+                    cert = {}
+                lines.append(f"TLS_Version: {ver}")
+                if cipher:
+                    name, proto, bits = cipher[0], cipher[1], cipher[2] if len(cipher) > 2 else ""
+                    lines.append(f"Cipher: {name} ({bits} bits)")
+                subj = dict(x[0] for x in cert.get('subject', ())) if cert else {}
+                issr = dict(x[0] for x in cert.get('issuer', ())) if cert else {}
+                lines.append(f"Subject_CN: {subj.get('commonName','')}")
+                lines.append(f"Issuer_CN: {issr.get('commonName','')}")
+                lines.append(f"NotBefore: {cert.get('notBefore','')}")
+                lines.append(f"NotAfter: {cert.get('notAfter','')}")
+    except Exception:
+        logger.exception("ssl_tls_probe(): TLS probe failed for %s", host)
+        lines.append("probe_error: true")
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    (case_dir / "recon" / "ssl_labs.txt").write_text("\n".join(lines))
+    state["checklist"]["ssl"] = True
+    logger.debug("ssl_tls_probe(): wrote to %s", out)
 
 def manual_ssl(case_dir, state):
     logger.debug("Starting manual_ssl step")
-    # CHECKLIST: ssl
-    print("[!] Manual Step: Run SSL Labs scan")
-    print("    https://www.ssllabs.com/ssltest/")
-    notes = prompt_multiline("Paste SSL grade & notes")
-    (case_dir / "recon" / "ssl_labs.txt").write_text(notes)
-    state["checklist"]["ssl"] = True
-    logger.debug("manual_ssl(): notes saved to %s", case_dir / "recon" / "ssl_labs.txt")
+    # Default to automated TLS probe to avoid manual input
+    return ssl_tls_probe(case_dir, state)
 
 def manual_shodan(case_dir, state):
     logger.debug("Starting manual_shodan step")
@@ -655,6 +698,19 @@ def shodan_lookup(case_dir, state):
     query = f'hostname:"{state["domain"]}"'
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     try:
+        # Ensure Shodan CLI is initialized; prompt to init if needed
+        try:
+            info = subprocess.run(["shodan", "info"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except Exception:
+            info = None
+        if (not info) or info.returncode != 0:
+            try:
+                if yes_no("Shodan CLI appears uninitialized. Initialize now?"):
+                    key = _get_shodan_api_key(interactive=True)
+                    if key:
+                        subprocess.run(["shodan", "init", key], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            except Exception:
+                pass
         with open(out, "w", encoding="utf-8", errors="ignore") as f:
             result = subprocess.run([
                 "shodan", "search", "--limit", "100", query
@@ -662,6 +718,33 @@ def shodan_lookup(case_dir, state):
         logger.debug("shodan_lookup(): return code %s", getattr(result, "returncode", None))
         if result.returncode != 0:
             logger.warning("shodan search returned non-zero exit code: %s", result.returncode)
+        # Also capture domain overview and host details for resolved IPs
+        with open(out, "a", encoding="utf-8", errors="ignore") as f:
+            f.write("\n\n===== shodan domain =====\n")
+            try:
+                subprocess.run(["shodan", "domain", state["domain"]], stdout=f, stderr=subprocess.STDOUT, text=True)
+            except Exception:
+                pass
+            # Resolve A/AAAA records and query host info per IP
+            f.write("\n\n===== shodan host (resolved IPs) =====\n")
+            ips = set()
+            try:
+                for family in (socket.AF_INET, socket.AF_INET6):
+                    try:
+                        infos = socket.getaddrinfo(state["domain"], None, family, socket.SOCK_STREAM)
+                        for info in infos:
+                            ip = info[4][0]
+                            ips.add(ip)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            for ip in sorted(ips):
+                f.write(f"\n----- {ip} -----\n")
+                try:
+                    subprocess.run(["shodan", "host", ip], stdout=f, stderr=subprocess.STDOUT, text=True)
+                except Exception:
+                    continue
     except Exception:
         logger.exception("Error running Shodan CLI search")
     state["checklist"]["shodan"] = True
@@ -670,6 +753,9 @@ def shodan_lookup(case_dir, state):
 def upload_screenshots(case_dir, state):
     logger.debug("Starting upload_screenshots step")
     # CHECKLIST: screenshots
+    if os.getenv("SECOPS_AUTO") or os.getenv("SECOPS_NON_INTERACTIVE"):
+        logger.debug("upload_screenshots(): auto mode skipping screenshot prompt")
+        return
     if yes_no("Do you have screenshots to upload?"):
         path = prompt("Path to screenshot directory")
         count = 0
@@ -688,20 +774,12 @@ def upload_screenshots(case_dir, state):
 def risk_scoring(case_dir, state):
     logger.debug("Starting risk_scoring step")
     # CHECKLIST: risk_score
-    suggested = None
     try:
-        suggested = int(state.get("ai", {}).get("suggested_score"))
+        score = int(state.get("ai", {}).get("suggested_score"))
     except Exception:
-        suggested = None
-    if suggested is not None:
-        raw = prompt(f"Enter overall exposure score (0–100) [suggested {suggested}]")
-        if raw == "":
-            score = suggested
-        else:
-            val = _extract_score(raw, 0, 100)
-            score = val if val is not None else _prompt_int_in_range("Enter overall exposure score (0–100)")
-    else:
-        score = _prompt_int_in_range("Enter overall exposure score (0–100)")
+        score = None
+    if score is None:
+        score = 50
     state["risk_score"] = score
     state["checklist"]["risk_score"] = True
     logger.debug("risk_scoring(): set risk_score=%s", score)
@@ -738,7 +816,7 @@ def generate_report(case_dir, state):
         f"- {ck_mark('tech_stack')} WhatWeb",
         f"- {ck_mark('subdomains')} Subdomains",
         f"- {ck_mark('crtsh')} crt.sh",
-        f"- {ck_mark('ssl')} SSL Labs (manual)",
+        f"- {ck_mark('ssl')} SSL/TLS",
         f"- {ck_mark('shodan')} Shodan",
         f"- {ck_mark('screenshots')} Screenshots",
         f"- {ck_mark('risk_score')} Risk Score",
@@ -791,7 +869,7 @@ def generate_report(case_dir, state):
     appendix += subsection("WhatWeb", whatweb_txt)
     appendix += subsection("Subdomains (subfinder)", subdomains_txt)
     appendix += subsection("crt.sh", crtsh_txt)
-    appendix += subsection("SSL Labs (manual notes)", ssl_labs_txt)
+    appendix += subsection("SSL/TLS", ssl_labs_txt)
     appendix += subsection("Shodan", shodan_txt)
 
     logs = "\n".join(getattr(_log_memory_handler, "records", []))
@@ -866,10 +944,15 @@ def main():
     logger.debug("main(): crtsh_lookup() complete")
 
     # === Manual Intelligence ===
-    # Step: SSL Labs
-    logger.debug("main(): manual_ssl() start")
-    manual_ssl(case_dir, state)
-    logger.debug("main(): manual_ssl() complete")
+    # Step: SSL/TLS
+    if os.getenv("SECOPS_AUTO") or os.getenv("SECOPS_NON_INTERACTIVE"):
+        logger.debug("main(): ssl_tls_probe() start")
+        ssl_tls_probe(case_dir, state)
+        logger.debug("main(): ssl_tls_probe() complete")
+    else:
+        logger.debug("main(): manual_ssl() start")
+        manual_ssl(case_dir, state)
+        logger.debug("main(): manual_ssl() complete")
     # Step: Shodan
     logger.debug("main(): shodan_lookup() start")
     shodan_lookup(case_dir, state)
