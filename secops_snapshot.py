@@ -1549,12 +1549,19 @@ def generate_report(case_dir, state):
         for k, v in replacements.items():
             report = report.replace(k, v)
 
-    # Optional appendices (disabled by default to avoid excessive length)
-    include_appendices = (os.getenv("SECOPS_INCLUDE_APPENDICES", "").strip().lower() in ("1", "true", "yes"))
-    if include_appendices:
-        def subsection(title, body):
-            body = (body or "").strip() or "(no data)"
-            return f"\n\n### {title}\n\n```\n{body}\n```\n"
+    # Artifact inclusion mode: none | relevant | full
+    # - none: no appendices (minimal report)
+    # - relevant (default): include concise excerpts mapped to observed risks/observations
+    # - full: include all artifacts and run log
+    mode_env = (os.getenv("SECOPS_ARTIFACT_MODE", "").strip().lower())
+    include_full_flag = (os.getenv("SECOPS_INCLUDE_APPENDICES", "").strip().lower() in ("1", "true", "yes"))
+    artifact_mode = "full" if include_full_flag else (mode_env or "relevant")
+
+    def subsection(title, body):
+        body = (body or "").strip() or "(no data)"
+        return f"\n\n### {title}\n\n```\n{body}\n```\n"
+
+    if artifact_mode == "full":
         appendix = "\n\n## Appendix A: Recon Artifacts\n"
         appendix += subsection("WHOIS", whois_txt)
         appendix += subsection("DNS (dig)", dns_txt)
@@ -1568,6 +1575,57 @@ def generate_report(case_dir, state):
         logs = "\n".join(getattr(_log_memory_handler, "records", []))
         appendix += "\n\n## Appendix B: Run Log\n"
         appendix += subsection("Run Log", logs)
+        report += appendix
+    elif artifact_mode != "none":
+        # Relevant: choose excerpts based on area ratings and observation keywords
+        obs_text = (state.get("observations_md") or "") + "\n" + (state.get("ai", {}).get("observations_md") or "")
+        def _has_terms(text, terms):
+            t = (text or "").lower()
+            return any(x in t for x in terms)
+        def _filter_lines(txt, patterns=None, max_lines=80):
+            if not txt:
+                return "(no data)"
+            lines = txt.splitlines()
+            if not patterns:
+                return "\n".join(lines[:max_lines])
+            pats = [p.lower() for p in patterns]
+            kept = []
+            for ln in lines:
+                lnl = ln.lower()
+                if any(p in lnl for p in pats):
+                    kept.append(ln)
+                if len(kept) >= max_lines:
+                    break
+            return "\n".join(kept or lines[:max_lines])
+
+        appendix = "\n\n## Appendix A: Relevant Artifacts\n"
+        # Domain & DNS or mentions
+        if (area.get("domain_dns", "Medium") != "Low") or _has_terms(obs_text, ["dns", "ns", "mx", "spf", "dkim", "dmarc", "dnssec"]):
+            appendix += subsection("DNS (dig)", _filter_lines(dns_txt, max_lines=60))
+            appendix += subsection("crt.sh", _filter_lines(crtsh_txt, max_lines=60))
+        # Security Headers
+        if (area.get("sec_headers", "Medium") != "Low") or _has_terms(obs_text, ["header", "hsts", "csp", "x-frame", "x-content-type", "referrer-policy", "permissions-policy"]):
+            appendix += subsection("HTTP Headers", _filter_lines(headers_txt, patterns=[
+                "strict-transport-security", "content-security-policy", "x-frame-options",
+                "x-content-type-options", "referrer-policy", "permissions-policy", "x-xss-protection"
+            ], max_lines=40))
+        # SSL/TLS
+        if (area.get("ssl", "Medium") != "Low") or _has_terms(obs_text, ["tls", "ssl", "certificate", "cipher", "weak", "legacy"]):
+            appendix += subsection("SSL/TLS", _filter_lines(ssl_labs_txt, patterns=[
+                "tls_version", "cipher", "subject_cn", "issuer_cn", "notbefore", "notafter"
+            ], max_lines=40))
+        # Tech Stack
+        if (area.get("tech_stack", "Medium") != "Low") or _has_terms(obs_text, ["wordpress", "apache", "nginx", "iis", "jquery", "outdated", "version"]):
+            appendix += subsection("WhatWeb", _filter_lines(whatweb_txt, max_lines=60))
+        # Shodan
+        if _has_terms(obs_text, ["shodan", "open port", "exposed", "service"]) or (area.get("domain_dns", "Medium") != "Low") or (area.get("ssl", "Medium") != "Low"):
+            appendix += subsection("Shodan", _filter_lines(shodan_txt, patterns=["port:", "vuln", "cve", "http", "ssl", "ssh", "rdp", "ftp"], max_lines=120))
+        # Subdomains
+        if _has_terms(obs_text, ["subdomain", "staging", "dev", "admin"]) or (subdomains_txt.strip()):
+            appendix += subsection("Subdomains (subfinder)", _filter_lines(subdomains_txt, max_lines=80))
+        # WHOIS if DNS issues noted
+        if _has_terms(obs_text, ["registrar", "privacy", "whois", "expiration", "expires", "name server"]):
+            appendix += subsection("WHOIS", _filter_lines(whois_txt, max_lines=60))
         report += appendix
 
     # Sanitize for ASCII-only (avoids LaTeX/PDF unicode issues) and write to case directory
