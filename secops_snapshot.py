@@ -55,9 +55,11 @@ except Exception:  # pragma: no cover
 
 import logging
 
-# Logging configuration
+# Logging configuration (INFO by default; DEBUG when SECOPS_DEBUG=1)
+_env_level = os.getenv("SECOPS_LOG_LEVEL") or ("DEBUG" if os.getenv("SECOPS_DEBUG") else "INFO")
+_log_level = getattr(logging, str(_env_level).upper(), logging.INFO)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=_log_level,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 logger = logging.getLogger("secops_snapshot")
@@ -76,6 +78,18 @@ class _InMemoryLogHandler(logging.Handler):
 _log_memory_handler = _InMemoryLogHandler()
 _log_memory_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s"))
 logger.addHandler(_log_memory_handler)
+
+# Quiet noisy third-party debug logs unless explicitly in DEBUG
+if _log_level > logging.DEBUG:
+    for _name in [
+        "httpx", "httpcore", "urllib3",
+        "googleapiclient", "googleapiclient.discovery", "googleapiclient.http",
+        "openai",
+    ]:
+        try:
+            logging.getLogger(_name).setLevel(logging.WARNING)
+        except Exception:
+            pass
 
 # =========================
 # CONFIGURATION
@@ -409,6 +423,44 @@ def _get_openai_api_key(interactive: bool = True) -> str:
         _save_config(cfg)
     return key
 
+def _validate_openai_api_key(key: str) -> bool:
+    if not key or len(key) < 20:
+        return False
+    try:
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {key}"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            code = getattr(r, "status", None) or r.getcode()
+            if int(code) != 200:
+                return False
+            try:
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+            except Exception:
+                return False
+            return isinstance(data, dict) and "data" in data
+    except Exception:
+        return False
+
+def _require_openai_api_key() -> str:
+    cfg = _load_config()
+    key = os.getenv("OPENAI_API_KEY") or cfg.get("openai_api_key") or ""
+    if key and _validate_openai_api_key(key):
+        return key.strip()
+    attempts = 0
+    while attempts < 3:
+        print("[!] OpenAI API key is required for AI-assisted reporting.")
+        k = getpass.getpass("[+] Enter OpenAI API key (starts with 'sk-'): ").strip()
+        if _validate_openai_api_key(k):
+            cfg["openai_api_key"] = k
+            _save_config(cfg)
+            return k
+        print("[!] Invalid OpenAI API key; please try again.")
+        attempts += 1
+    logger.warning("Skipping AI assistance due to invalid OpenAI API key after multiple attempts")
+    return ""
+
 def _get_shodan_api_key(interactive: bool = True) -> str:
     env_key = os.getenv("SHODAN_API_KEY")
     if env_key:
@@ -482,9 +534,9 @@ def _extract_json_block(text: str) -> dict:
     return {}
 
 def ai_assist(case_dir, state):
-    api_key = _get_openai_api_key(interactive=True)
+    api_key = _require_openai_api_key()
     if not api_key:
-        logger.warning("No OpenAI API key provided; skipping AI assistance")
+        print("[!] Skipping AI assistance due to missing/invalid OpenAI API key.")
         return
 
     recon_dir = case_dir / "recon"
