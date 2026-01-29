@@ -1330,6 +1330,8 @@ def shodan_lookup(case_dir, state):
                             f.write(r.read().decode("utf-8", "ignore"))
                         except Exception as e:
                             f.write(f"HTTP API host error for {ip}: {e}\n")
+                except Exception as e:
+                    f.write(f"HTTP API host enumeration error: {e}\n")
     except Exception:
         logger.exception("Error running Shodan CLI search")
     state["checklist"]["shodan"] = True
