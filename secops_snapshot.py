@@ -656,7 +656,7 @@ def _get_google_credentials():
     # Attempt OAuth flow; if directory/file errors occur, re-prompt once
     try:
         flow = _InstalledAppFlow.from_client_secrets_file(client_path, GOOGLE_SCOPES)
-        creds = flow.run_local_server(port=0)
+        creds = _google_run_oauth_flow(flow)
         GOOGLE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         GOOGLE_TOKEN_FILE.write_text(creds.to_json())
         return creds
@@ -742,6 +742,21 @@ def _google_config_ready():
     cfg = _load_config()
     p = cfg.get("google_client_secret_path")
     return bool(p and Path(p).is_file() and GOOGLE_TOKEN_FILE.exists())
+
+def _google_run_oauth_flow(flow):
+    """Run OAuth flow with a browser if available, otherwise fall back to console.
+    Users can force console-based flow by setting SECOPS_GOOGLE_CONSOLE_FLOW=1.
+    """
+    prefer_console = str(os.getenv("SECOPS_GOOGLE_CONSOLE_FLOW", "")).strip().lower() in {"1", "true", "yes"}
+    headless = bool(os.getenv("WSL_DISTRO_NAME")) and shutil.which("xdg-open") is None
+    if prefer_console or headless:
+        print("[i] Using console-based OAuth flow. Copy the URL, authorize, and paste the code.")
+        return flow.run_console()
+    try:
+        return flow.run_local_server(port=0)
+    except Exception:
+        print("[!] Browser-based OAuth failed. Falling back to console copy-paste flow.")
+        return flow.run_console()
 
 def _drive_ensure_folder(drive, name, parent_id=None):
     try:
