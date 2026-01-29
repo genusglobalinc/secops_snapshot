@@ -303,6 +303,31 @@ def _read_text(path: Path, default: str = "") -> str:
     except Exception:
         return default
 
+def _sanitize_ascii(text: str) -> str:
+    if not text:
+        return text
+    repl = {
+        "–": "-", "—": "-", "‑": "-", "−": "-",
+        "•": "-", "·": "-",
+        "“": '"', "”": '"', "„": '"',
+        "’": "'", "‘": "'", "´": "'",
+        "…": "...",
+        "✓": "[x]", "✔": "[x]", "✗": "[ ]",
+        "→": "->", "←": "<-",
+        "\u00A0": " ", "\u200B": "",
+    }
+    for k, v in repl.items():
+        text = text.replace(k, v)
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if o in (9, 10, 13) or (32 <= o <= 126):
+            out.append(ch)
+        else:
+            # drop non-ascii control/unicode
+            pass
+    return "".join(out)
+
 def _load_config() -> dict:
     try:
         if CONFIG_FILE.exists():
@@ -480,19 +505,19 @@ def ai_assist(case_dir, state):
     shodan_txt = _read_text(recon_dir / "shodan.txt")
 
     sys_prompt = (
-        "You are a security analyst. Read passive recon artifacts and suggest: "
-        "area risk levels (use labels Low/Medium/High, not abbreviations) for Domain/DNS, Tech Stack, Email/Creds, SSL, Sec Headers; "
-        "a Key Observations section in the business template style (3–5 items); and an overall exposure score 0–100. "
-        "Then compose a complete, clean Markdown report body that includes: a title in the format '<Business Name> Passive Security Exposure Snapshot', "
-        "a header block with Prepared for, Website, Date, Prepared by; and sections 1–7 (Executive Summary, Exposure Overview, Key Observations, "
-        "Exposure Risk Score, Recommended Next Steps, Authorization & Disclosure, Optional Consultation). "
-        "Render the Exposure Overview as a 3-column markdown table with headers 'Area', 'Status', 'Risk Level' and values 'Observed' for Status. "
-        "In the Executive Summary include both 'Overall Exposure Rating' and 'Overall Exposure Score: N / 100'. "
-        "Map score to rating using: 0–24 Low, 25–49 Moderate, 50–74 Elevated, 75–100 High. "
-        "In section 7 include the provided contact as 'Contact: <contact>'. "
-        "Do NOT include any appendices; the system will add artifacts and run log later. "
-        "Output ONLY JSON with keys: area_ratings (object with keys: domain_dns, tech_stack, email_creds, ssl, sec_headers), "
-        "observations_md (string), suggested_score (int), report_md (string with the full Markdown report)."
+        "You are a security analyst. Read passive recon artifacts and infer real security exposures based on common vulnerable patterns "
+        "(e.g., missing HSTS, weak/legacy TLS, insecure headers, exposed services/ports, outdated tech, sensitive subdomains). "
+        "Produce: area risk levels (use labels Low/Medium/High) for Domain/DNS, Tech Stack, Email/Creds, SSL, Sec Headers; a Key Observations section "
+        "(3 to 5 concise items) grounded in the artifacts with short evidence notes; and an overall exposure score 0–100. "
+        "Then compose a complete Markdown report that EXACTLY follows these sections and order with plain ASCII only: "
+        "title: 'Passive Security Exposure Snapshot'; header lines 'Prepared for: <Business Name>', 'Website: <domain>', 'Date: <date>', 'Prepared by: <prepared_by>'; "
+        "sections 1–7: Executive Summary; Exposure Overview; Key Observations (Top 3-5); Exposure Risk Score; Recommended Next Steps; Authorization & Disclosure; Optional Consultation. "
+        "Render Exposure Overview as a 3-column markdown table with headers Area | Status | Risk Level and use the exact row labels: "
+        "Domain & DNS Configuration, Website Technology Stack, Email & Credential Exposure, SSL / Transport Security, Security Headers. Status must be 'Observed'. "
+        "In Executive Summary include only 'Overall Exposure Rating: <Low/Moderate/Elevated/High>' (map score: 0-24 Low, 25-49 Moderate, 50-74 Elevated, 75-100 High). "
+        "In Exposure Risk Score include 'Overall Exposure Score: <N>' and the short explanation. "
+        "Do NOT include any raw logs, code blocks, or appendices. Be concise (<= 500 words). Use only ASCII characters; replace fancy punctuation with '-' and standard quotes. "
+        "Output ONLY JSON with keys: area_ratings (object with keys: domain_dns, tech_stack, email_creds, ssl, sec_headers), observations_md (string), suggested_score (int), report_md (string)."
     )
     user_payload = {
         "business_name": state.get("business_name", ""),
@@ -1440,36 +1465,29 @@ def generate_report(case_dir, state):
         for k, v in replacements.items():
             report = report.replace(k, v)
 
-    # Recon sections and manual notes
-    def section(title, body):
-        body = body.strip()
-        if not body:
-            body = "(no data)"
-        return f"\n\n## {title}\n\n```\n{body}\n```\n"
+    # Optional appendices (disabled by default to avoid excessive length)
+    include_appendices = (os.getenv("SECOPS_INCLUDE_APPENDICES", "").strip().lower() in ("1", "true", "yes"))
+    if include_appendices:
+        def subsection(title, body):
+            body = (body or "").strip() or "(no data)"
+            return f"\n\n### {title}\n\n```\n{body}\n```\n"
+        appendix = "\n\n## Appendix A: Recon Artifacts\n"
+        appendix += subsection("WHOIS", whois_txt)
+        appendix += subsection("DNS (dig)", dns_txt)
+        appendix += subsection("HTTP Headers", headers_txt)
+        appendix += subsection("robots.txt", robots_txt)
+        appendix += subsection("WhatWeb", whatweb_txt)
+        appendix += subsection("Subdomains (subfinder)", subdomains_txt)
+        appendix += subsection("crt.sh", crtsh_txt)
+        appendix += subsection("SSL/TLS", ssl_labs_txt)
+        appendix += subsection("Shodan", shodan_txt)
+        logs = "\n".join(getattr(_log_memory_handler, "records", []))
+        appendix += "\n\n## Appendix B: Run Log\n"
+        appendix += subsection("Run Log", logs)
+        report += appendix
 
-    # Append appendices for artifacts and logs
-    def subsection(title, body):
-        body = body.strip() or "(no data)"
-        return f"\n\n### {title}\n\n```\n{body}\n```\n"
-
-    appendix = ""
-    appendix += "\n\n## Appendix A: Recon Artifacts\n"
-    appendix += subsection("WHOIS", whois_txt)
-    appendix += subsection("DNS (dig)", dns_txt)
-    appendix += subsection("HTTP Headers", headers_txt)
-    appendix += subsection("robots.txt", robots_txt)
-    appendix += subsection("WhatWeb", whatweb_txt)
-    appendix += subsection("Subdomains (subfinder)", subdomains_txt)
-    appendix += subsection("crt.sh", crtsh_txt)
-    appendix += subsection("SSL/TLS", ssl_labs_txt)
-    appendix += subsection("Shodan", shodan_txt)
-
-    logs = "\n".join(getattr(_log_memory_handler, "records", []))
-    appendix += "\n\n## Appendix B: Run Log\n"
-    appendix += subsection("Run Log", logs)
-
-    report += appendix
-
+    # Sanitize for ASCII-only (avoids LaTeX/PDF unicode issues) and write to case directory
+    report = _sanitize_ascii(report)
     # Write to case directory (existing behavior)
     md_path_case = case_dir / "reports" / "report.md"
     md_path_case.write_text(report)
