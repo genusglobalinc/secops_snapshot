@@ -649,6 +649,24 @@ def manual_shodan(case_dir, state):
     state["checklist"]["shodan"] = True
     logger.debug("manual_shodan(): notes saved to %s", case_dir / "recon" / "shodan.txt")
 
+def shodan_lookup(case_dir, state):
+    logger.debug("Starting shodan_lookup for domain %s", state["domain"])
+    out = case_dir / "recon" / "shodan.txt"
+    query = f'hostname:"{state["domain"]}"'
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(out, "w", encoding="utf-8", errors="ignore") as f:
+            result = subprocess.run([
+                "shodan", "search", "--limit", "100", query
+            ], stdout=f, stderr=subprocess.STDOUT, text=True)
+        logger.debug("shodan_lookup(): return code %s", getattr(result, "returncode", None))
+        if result.returncode != 0:
+            logger.warning("shodan search returned non-zero exit code: %s", result.returncode)
+    except Exception:
+        logger.exception("Error running Shodan CLI search")
+    state["checklist"]["shodan"] = True
+    logger.debug("shodan_lookup(): wrote to %s", out)
+
 def upload_screenshots(case_dir, state):
     logger.debug("Starting upload_screenshots step")
     # CHECKLIST: screenshots
@@ -721,7 +739,7 @@ def generate_report(case_dir, state):
         f"- {ck_mark('subdomains')} Subdomains",
         f"- {ck_mark('crtsh')} crt.sh",
         f"- {ck_mark('ssl')} SSL Labs (manual)",
-        f"- {ck_mark('shodan')} Shodan (manual)",
+        f"- {ck_mark('shodan')} Shodan",
         f"- {ck_mark('screenshots')} Screenshots",
         f"- {ck_mark('risk_score')} Risk Score",
         f"- {ck_mark('report_generated')} Report Generated",
@@ -774,7 +792,7 @@ def generate_report(case_dir, state):
     appendix += subsection("Subdomains (subfinder)", subdomains_txt)
     appendix += subsection("crt.sh", crtsh_txt)
     appendix += subsection("SSL Labs (manual notes)", ssl_labs_txt)
-    appendix += subsection("Shodan (manual notes)", shodan_txt)
+    appendix += subsection("Shodan", shodan_txt)
 
     logs = "\n".join(getattr(_log_memory_handler, "records", []))
     appendix += "\n\n## Appendix B: Run Log\n"
@@ -853,9 +871,9 @@ def main():
     manual_ssl(case_dir, state)
     logger.debug("main(): manual_ssl() complete")
     # Step: Shodan
-    logger.debug("main(): manual_shodan() start")
-    manual_shodan(case_dir, state)
-    logger.debug("main(): manual_shodan() complete")
+    logger.debug("main(): shodan_lookup() start")
+    shodan_lookup(case_dir, state)
+    logger.debug("main(): shodan_lookup() complete")
     # Step: Upload screenshots
     logger.debug("main(): upload_screenshots() start")
     upload_screenshots(case_dir, state)
