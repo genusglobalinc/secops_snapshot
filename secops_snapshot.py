@@ -350,6 +350,36 @@ def _load_config() -> dict:
         pass
     return {}
 
+def _prompt_secret(message: str) -> str:
+    """Prompt for a secret. Uses getpass by default. Fallbacks:
+    - If SECOPS_VISIBLE_INPUT=1, use visible input() warning that input will be echoed.
+    - If user enters a value starting with '@', treat the remainder as a file path and read the first line.
+    """
+    try:
+        if os.getenv("SECOPS_VISIBLE_INPUT"):
+            print("[!] Input will be visible on screen.")
+            val = input(f"{message} ")
+        else:
+            val = getpass.getpass(f"{message} ")
+    except Exception:
+        # Fallback to visible input in non-TTY environments
+        print("[!] Secure input not available; input will be visible.")
+        val = input(f"{message} ")
+    val = (val or "").strip()
+    if val.startswith("@") and len(val) > 1:
+        path = val[1:].strip().strip('"')
+        try:
+            txt = Path(path).read_text(encoding="utf-8", errors="ignore").strip()
+            # take the first non-empty line
+            for line in txt.splitlines():
+                line = line.strip()
+                if line and not line.lower().startswith("open ai key"):
+                    return line
+            return txt
+        except Exception:
+            logger.exception("Failed to read secret from file: %s", path)
+    return val
+
 def _get_prepared_by(interactive: bool = True) -> str:
     cfg = _load_config()
     val = (cfg.get("prepared_by") or "").strip()
@@ -417,7 +447,7 @@ def _get_openai_api_key(interactive: bool = True) -> str:
     if not interactive:
         return ""
     print("[!] OpenAI API key is required for AI-assisted reporting.")
-    key = getpass.getpass("[+] Enter OpenAI API key (starts with 'sk-'): ").strip()
+    key = _prompt_secret("[+] Enter OpenAI API key (starts with 'sk-'):")
     if key:
         cfg["openai_api_key"] = key
         _save_config(cfg)
@@ -451,7 +481,7 @@ def _require_openai_api_key() -> str:
     attempts = 0
     while attempts < 3:
         print("[!] OpenAI API key is required for AI-assisted reporting.")
-        k = getpass.getpass("[+] Enter OpenAI API key (starts with 'sk-'): ").strip()
+        k = _prompt_secret("[+] Enter OpenAI API key (starts with 'sk-'):")
         if _validate_openai_api_key(k):
             cfg["openai_api_key"] = k
             _save_config(cfg)
@@ -471,7 +501,7 @@ def _get_shodan_api_key(interactive: bool = True) -> str:
     if not interactive:
         return ""
     print("[!] Shodan API key is required for Shodan CLI/API.")
-    key = getpass.getpass("[+] Enter Shodan API key: ").strip()
+    key = _prompt_secret("[+] Enter Shodan API key:")
     if key:
         cfg["shodan_api_key"] = key
         _save_config(cfg)
@@ -504,7 +534,7 @@ def _require_shodan_api_key() -> str:
     attempts = 0
     while attempts < 3:
         print("[!] Shodan API key is required for Shodan CLI/API.")
-        k = getpass.getpass("[+] Enter Shodan API key: ").strip()
+        k = _prompt_secret("[+] Enter Shodan API key:")
         if _validate_shodan_api_key(k):
             cfg["shodan_api_key"] = k
             _save_config(cfg)
@@ -604,6 +634,7 @@ def ai_assist(case_dir, state):
                             {"role": "system", "content": sys_prompt},
                             {"role": "user", "content": prompt_text},
                         ],
+                        response_format={"type": "json_object"},
                         temperature=0.2,
                     )
                     text = resp.choices[0].message.content
@@ -622,6 +653,7 @@ def ai_assist(case_dir, state):
                             {"role": "system", "content": sys_prompt},
                             {"role": "user", "content": prompt_text},
                         ],
+                        response_format={"type": "json_object"},
                         temperature=0.2,
                     )
                     text = resp["choices"][0]["message"]["content"]
