@@ -361,15 +361,25 @@ def ai_assist(case_dir, state):
 
     sys_prompt = (
         "You are a security analyst. Read passive recon artifacts and suggest: "
-        "area risk levels (Low/Med/High) for Domain/DNS, Tech Stack, Email/Creds, SSL, Sec Headers; "
-        "a Key Observations section in the provided business template style (3–5 items); "
-        "and an overall exposure score 0–100. Output ONLY JSON with keys: "
-        "area_ratings (object with keys: domain_dns, tech_stack, email_creds, ssl, sec_headers), "
-        "observations_md (string, markdown list formatted per template), suggested_score (int)."
+        "area risk levels (use labels Low/Medium/High, not abbreviations) for Domain/DNS, Tech Stack, Email/Creds, SSL, Sec Headers; "
+        "a Key Observations section in the business template style (3–5 items); and an overall exposure score 0–100. "
+        "Then compose a complete, clean Markdown report body that includes: a title in the format '<Business Name> Passive Security Exposure Snapshot', "
+        "a header block with Prepared for, Website, Date, Prepared by; and sections 1–7 (Executive Summary, Exposure Overview, Key Observations, "
+        "Exposure Risk Score, Recommended Next Steps, Authorization & Disclosure, Optional Consultation). "
+        "Render the Exposure Overview as a 3-column markdown table with headers 'Area', 'Status', 'Risk Level' and values 'Observed' for Status. "
+        "In the Executive Summary include both 'Overall Exposure Rating' and 'Overall Exposure Score: N / 100'. "
+        "Map score to rating using: 0–24 Low, 25–49 Moderate, 50–74 Elevated, 75–100 High. "
+        "In section 7 include the provided contact as 'Contact: <contact>'. "
+        "Do NOT include any appendices; the system will add artifacts and run log later. "
+        "Output ONLY JSON with keys: area_ratings (object with keys: domain_dns, tech_stack, email_creds, ssl, sec_headers), "
+        "observations_md (string), suggested_score (int), report_md (string with the full Markdown report)."
     )
     user_payload = {
         "business_name": state.get("business_name", ""),
         "domain": state.get("domain", ""),
+        "prepared_by": state.get("prepared_by", "Your Business Name"),
+        "contact": state.get("contact", "you@company.com"),
+        "date": state.get("date", ""),
         "artifacts": {
             "whois": whois_txt,
             "dns": dns_txt,
@@ -433,6 +443,7 @@ def ai_assist(case_dir, state):
 
     area = suggestion.get("area_ratings") or {}
     obs_md = suggestion.get("observations_md") or ""
+    report_md = suggestion.get("report_md") or ""
     try:
         ai_score = int(suggestion.get("suggested_score"))
     except Exception:
@@ -441,6 +452,8 @@ def ai_assist(case_dir, state):
     state.setdefault("ai", {})
     state["ai"]["area_ratings"] = area
     state["ai"]["observations_md"] = obs_md
+    if report_md:
+        state["ai"]["report_md"] = report_md
     if ai_score is not None:
         state["ai"]["suggested_score"] = ai_score
     # Pre-fill if not set
@@ -823,31 +836,35 @@ def generate_report(case_dir, state):
         f"- {ck_mark('report_generated')} Report Generated",
     ])
 
-    # Build base report (fill placeholders per new template)
-    report = REPORT_TEMPLATE
+    # Build base report: prefer AI-composed report if available
+    ai_report = (state.get("ai", {}) or {}).get("report_md", "")
     prepared_by = state.get("prepared_by", "Your Business Name")
     contact = state.get("contact", "you@company.com")
     score = int(state.get("risk_score", 0) or 0)
     overall_rating = state.get("overall_rating") or _compute_overall_rating(score)
     area = state.get("area_ratings", {})
 
-    replacements = {
-        "{{Business Name}}": state.get("business_name", ""),
-        "{{domain}}": state.get("domain", ""),
-        "{{date}}": state.get("date", ""),
-        "{{Your Business Name}}": prepared_by,
-        "{{Overall Exposure Rating}}": overall_rating,
-        "{{Overall Exposure Score}}": f"{score} / 100",
-        "{{Area_Domain_DNS}}": area.get("domain_dns", "Low"),
-        "{{Area_Tech_Stack}}": area.get("tech_stack", "Low"),
-        "{{Area_Email_Creds}}": area.get("email_creds", "Low"),
-        "{{Area_SSL}}": area.get("ssl", "Low"),
-        "{{Area_Sec_Headers}}": area.get("sec_headers", "Low"),
-        "{{contact}}": contact,
-        "{{observations_section}}": (state.get("observations_md") or "(none provided)")
-    }
-    for k, v in replacements.items():
-        report = report.replace(k, v)
+    if ai_report.strip():
+        report = ai_report
+    else:
+        report = REPORT_TEMPLATE
+        replacements = {
+            "{{Business Name}}": state.get("business_name", ""),
+            "{{domain}}": state.get("domain", ""),
+            "{{date}}": state.get("date", ""),
+            "{{Your Business Name}}": prepared_by,
+            "{{Overall Exposure Rating}}": overall_rating,
+            "{{Overall Exposure Score}}": f"{score} / 100",
+            "{{Area_Domain_DNS}}": area.get("domain_dns", "Medium"),
+            "{{Area_Tech_Stack}}": area.get("tech_stack", "Medium"),
+            "{{Area_Email_Creds}}": area.get("email_creds", "Medium"),
+            "{{Area_SSL}}": area.get("ssl", "Medium"),
+            "{{Area_Sec_Headers}}": area.get("sec_headers", "Medium"),
+            "{{contact}}": contact,
+            "{{observations_section}}": (state.get("observations_md") or "(none provided)")
+        }
+        for k, v in replacements.items():
+            report = report.replace(k, v)
 
     # Recon sections and manual notes
     def section(title, body):
@@ -861,7 +878,8 @@ def generate_report(case_dir, state):
         body = body.strip() or "(no data)"
         return f"\n\n### {title}\n\n```\n{body}\n```\n"
 
-    appendix = "\n\n## Appendix A: Recon Artifacts\n"
+    appendix = ""
+    appendix += "\n\n## Appendix A: Recon Artifacts\n"
     appendix += subsection("WHOIS", whois_txt)
     appendix += subsection("DNS (dig)", dns_txt)
     appendix += subsection("HTTP Headers", headers_txt)
