@@ -1381,6 +1381,76 @@ def _col_letter(idx_zero_based):
         s = chr(65 + r) + s
     return s
 
+def _print_help_extended():
+    try:
+        txt = f"""
+Passive Security Exposure Snapshot - Extended Help
+
+USAGE
+- Single-case interactive (default):
+  python secops_snapshot.py
+
+- Batch from Google Sheet (no single-case prompts):
+  python secops_snapshot.py --batch
+  or set environment variable SECOPS_BATCH=1
+
+MAIN OUTPUTS
+- Case directory: {CLIENTS_DIR}/<client>
+- Report markdown: <case>/reports/report.md and ./<client>_report.md
+- Report PDF (if pandoc installed): <case>/reports/report.pdf and ./<client>_report.pdf
+- Full artifacts and run log: <case>/reports/report_full_logs.txt
+
+CONFIG AND STATE
+- Config file: {CONFIG_FILE}
+- Outreach log (email timestamps): {OUTREACH_LOG_FILE}
+- Google OAuth token: {GOOGLE_TOKEN_FILE}
+
+GOOGLE INTEGRATION (Drive/Docs/Sheets)
+- First-time setup will store:
+  google_client_secret_path, google_sheet_id, google_sheet_name, drive_clients_root_name
+- Requirements: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+- To re-auth: delete {GOOGLE_TOKEN_FILE} and rerun setup
+
+EMAIL SENDING
+- After report generation, you can send an initial outreach email attaching the PDF.
+- SMTP settings are stored under 'email_smtp' in {CONFIG_FILE} (host, port, username, from_email, from_name, optional password).
+- Follow-ups are sent based on timestamps in {OUTREACH_LOG_FILE}:
+  - Follow-up 1 after 48 hours
+  - Final follow-up after 72 hours from follow-up 1
+
+SHODAN INTEGRATION
+- Requires a valid key; stored as shodan_api_key in config when provided.
+- Uses 'shodan' CLI if initialized, else falls back to HTTP API.
+
+OPENAI (optional, for AI-assisted report composition)
+- OPENAI_API_KEY is required when using AI assistance; key is stored in config once validated.
+
+CLI FLAGS
+- --batch                 Run Google Sheets batch processing and exit
+- --artifact-mode MODE    none | relevant | full (default relevant)
+- --shodan-include MODE   summary | excerpt | full (default excerpt)
+- --shodan-excerpt-lines N  number of lines for Shodan excerpt (default 25)
+- --help                  Show basic argparse help
+- --help-all              Show this extended help
+
+ENVIRONMENT VARIABLES
+- SECOPS_BATCH=1                Run in batch mode automatically
+- SECOPS_DEBUG=1 or SECOPS_LOG_LEVEL=LEVEL (INFO, DEBUG, etc.)
+- SECOPS_ARTIFACT_MODE=none|relevant|full
+- SECOPS_INCLUDE_APPENDICES=1   Force full appendices
+- SECOPS_VISIBLE_INPUT=1        Make secret prompts visible (fallback)
+- SECOPS_GOOGLE_CONSOLE_FLOW=1  Use console OAuth flow instead of browser
+- OPENAI_API_KEY, SHODAN_API_KEY
+
+TIPS
+- Store Google Sheet and OAuth once; subsequent runs won’t prompt again.
+- Use --batch for lead sheet processing; single-case prompts are only for interactive mode.
+"""
+        print(txt)
+    except Exception:
+        # Fallback minimal help if printing fails
+        print("Extended help unavailable due to an error.")
+
 def process_batch_from_google_sheet():
     drive, docs, sheets = _get_google_services()
     if not drive or not docs or not sheets:
@@ -2099,10 +2169,20 @@ def main():
         parser.add_argument("--artifact-mode", choices=["none", "relevant", "full"], dest="artifact_mode")
         parser.add_argument("--shodan-include", choices=["summary", "excerpt", "full"], dest="shodan_include")
         parser.add_argument("--shodan-excerpt-lines", type=int, dest="shodan_excerpt_lines")
+        parser.add_argument("--batch", action="store_true", dest="batch", help="Run Google Sheets batch processing and exit")
+        parser.add_argument("--help-all", action="store_true", dest="help_all", help="Show extended help and exit")
         parser.add_argument("-h", "--help", action="help", help="show this help message and exit")
         args, _unknown = parser.parse_known_args()
     except Exception:
-        args = type("Args", (), {"artifact_mode": None})()
+        args = type("Args", (), {"artifact_mode": None, "batch": False, "help_all": False})()
+    # Extended help early exit
+    try:
+        _env_help_all = str(os.getenv("SECOPS_HELP_ALL", "")).strip().lower() in {"1", "true", "yes"}
+        if getattr(args, "help_all", False) or _env_help_all:
+            _print_help_extended()
+            return
+    except Exception:
+        logger.exception("Extended help printing failed; continuing")
     # If Google not configured yet, trigger setup to ensure user sees OAuth prompts
     try:
         if _gbuild is not None and not _google_config_ready():
@@ -2116,6 +2196,15 @@ def main():
                 setup_google_integration_interactive()
     except Exception:
         logger.exception("Google setup prompt failed; continuing")
+    # Auto-batch via CLI flag or env var SECOPS_BATCH
+    try:
+        _env_batch = str(os.getenv("SECOPS_BATCH", "")).strip().lower() in {"1", "true", "yes"}
+        if _gbuild is not None and (args.batch or _env_batch):
+            process_batch_from_google_sheet()
+            print("[+] Batch processing complete")
+            return
+    except Exception:
+        logger.exception("Auto batch execution failed; continuing")
     try:
         if _gbuild is not None and yes_no("Process all pending sites from Google Sheet now?"):
             process_batch_from_google_sheet()
