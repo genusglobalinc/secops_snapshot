@@ -33,6 +33,7 @@ import smtplib
 from email.message import EmailMessage
 from email.utils import formatdate
 import mimetypes
+import time
 try:
     from openai import OpenAI as _OpenAIClient  # New-style client
 except Exception:  # pragma: no cover
@@ -663,65 +664,100 @@ def _get_email_config(interactive: bool = True) -> dict:
     return {}
 
 def _send_email(smtp_cfg: dict, to_email: str, subject: str, body: str, attachments: list = None) -> bool:
-    try:
-        to_email = (to_email or "").strip()
-        if not to_email:
-            return False
-        host = smtp_cfg.get("host")
-        port = int(smtp_cfg.get("port") or 587)
-        use_ssl = bool(smtp_cfg.get("use_ssl"))
-        use_tls = bool(smtp_cfg.get("use_tls", True))
-        user = smtp_cfg.get("username")
-        pw = smtp_cfg.get("password") or _prompt_secret("SMTP password:")
-        from_email = smtp_cfg.get("from_email") or user
-        from_name = smtp_cfg.get("from_name") or from_email
-        msg = EmailMessage()
-        if from_name and from_name != from_email:
-            msg["From"] = f"{from_name} <{from_email}>"
-        else:
-            msg["From"] = from_email
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        msg["Date"] = formatdate(localtime=False)
-        msg.set_content(body)
-        for ap in (attachments or []):
-            try:
-                path = Path(ap)
-                if not path.exists():
-                    continue
-                ctype, enc = mimetypes.guess_type(str(path))
-                if ctype is None:
-                    ctype = "application/octet-stream"
-                maintype, subtype = ctype.split("/", 1)
-                with open(path, "rb") as f:
-                    data = f.read()
-                msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=path.name)
-            except Exception:
-                logger.exception("Failed attaching %s", ap)
-        if use_ssl:
-            server = smtplib.SMTP_SSL(host, port)
-        else:
-            server = smtplib.SMTP(host, port)
+    to_email = (to_email or "").strip()
+    if not to_email:
+        print("[!] No recipient email provided; skipping send")
+        return False
+    host = smtp_cfg.get("host")
+    port = int(smtp_cfg.get("port") or 587)
+    use_ssl = bool(smtp_cfg.get("use_ssl"))
+    use_tls = bool(smtp_cfg.get("use_tls", True))
+    user = smtp_cfg.get("username")
+    pw = smtp_cfg.get("password") or _prompt_secret("SMTP password:")
+    from_email = smtp_cfg.get("from_email") or user
+    from_name = smtp_cfg.get("from_name") or from_email
+    msg = EmailMessage()
+    if from_name and from_name != from_email:
+        msg["From"] = f"{from_name} <{from_email}>"
+    else:
+        msg["From"] = from_email
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=False)
+    msg.set_content(body)
+    for ap in (attachments or []):
         try:
-            server.ehlo()
-            if (not use_ssl) and use_tls:
-                server.starttls()
+            path = Path(ap)
+            if not path.exists():
+                continue
+            ctype, _enc = mimetypes.guess_type(str(path))
+            if ctype is None:
+                ctype = "application/octet-stream"
+            maintype, subtype = ctype.split("/", 1)
+            with open(path, "rb") as f:
+                data = f.read()
+            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=path.name)
+        except Exception:
+            logger.exception("Failed attaching %s", ap)
+    attempts = 0
+    while attempts < 2:
+        attempts += 1
+        try:
+            server = smtplib.SMTP_SSL(host, port) if use_ssl else smtplib.SMTP(host, port)
+            try:
+                if os.getenv("SECOPS_SMTP_DEBUG"):
+                    try:
+                        server.set_debuglevel(1)
+                    except Exception:
+                        pass
+                server.ehlo()
+                if (not use_ssl) and use_tls:
+                    server.starttls()
+                    try:
+                        server.ehlo()
+                    except Exception:
+                        pass
+                if user:
+                    server.login(user, pw)
+                server.send_message(msg)
+                print(f"[+] Email sent to {to_email}")
+                return True
+            finally:
                 try:
-                    server.ehlo()
+                    server.quit()
                 except Exception:
                     pass
-            if user:
-                server.login(user, pw)
-            server.send_message(msg)
-        finally:
-            try:
-                server.quit()
-            except Exception:
-                pass
-        return True
-    except Exception:
-        logger.exception("Email send failed to %s", to_email)
-        return False
+        except smtplib.SMTPAuthenticationError as e:
+            logger.error("SMTP auth failed (%s): %s", getattr(e, 'smtp_code', 'auth'), getattr(e, 'smtp_error', e))
+            print("[!] SMTP authentication failed. Check username/App Password and server settings.")
+            return False
+        except smtplib.SMTPServerDisconnected as e:
+            logger.warning("SMTP server disconnected: %s", e)
+            print("[!] SMTP server disconnected; retrying once...")
+            time.sleep(2)
+            continue
+        except smtplib.SMTPConnectError as e:
+            logger.error("SMTP connect error (%s): %s", getattr(e, 'smtp_code', 'connect'), getattr(e, 'smtp_error', e))
+            print("[!] Could not connect to SMTP server. Verify host/port and network access.")
+            return False
+        except smtplib.SMTPRecipientsRefused as e:
+            logger.error("SMTP recipients refused: %s", e)
+            print("[!] Recipient address refused by server.")
+            return False
+        except smtplib.SMTPSenderRefused as e:
+            logger.error("SMTP sender refused: %s", e)
+            print("[!] Sender address refused by server. Check from_email/username match.")
+            return False
+        except smtplib.SMTPResponseException as e:
+            logger.error("SMTP response error (%s): %s", getattr(e, 'smtp_code', '?'), getattr(e, 'smtp_error', e))
+            print("[!] SMTP server returned an error response.")
+            return False
+        except Exception as e:
+            logger.exception("Email send failed to %s", to_email)
+            print(f"[!] Email send error: {e}")
+            return False
+    print("[!] Email send failed after retry")
+    return False
 
 def send_outreach_post_report(case_dir, state, to_email: str, recipient_name: str = None) -> bool:
     company = state.get("business_name") or state.get("domain")
@@ -1523,8 +1559,11 @@ def process_batch_from_google_sheet(interactive: bool = True):
         gen = get(gen_idx).lower()
         emailed_flag = get(emailed_idx).lower()
         if not website:
+            print(f"[-] Row {r_idx+1}: missing website; skipping")
             continue
+        print(f"[>] Row {r_idx+1}: {website} | email={email or '-'} | gen={gen or '-'} | emailed={emailed_flag or '-'}")
         if gen == 'y' and emailed_flag == 'y':
+            print(f"[-] {website}: already generated and emailed; skipping")
             continue
         domain = _normalize_domain(website)
         # Resolve display business name from config mapping (fallback to domain)
@@ -1536,18 +1575,31 @@ def process_batch_from_google_sheet(interactive: bool = True):
         state['contact'] = state.get('contact') or _get_default_contact(interactive=False)
         prepared_by = _get_prepared_by(interactive=False)
         state['prepared_by'] = prepared_by
+        print(f"[.] Recon: whois for {domain}")
         whois_lookup(case_dir, state)
+        print(f"[.] Recon: dns for {domain}")
         dns_lookup(case_dir, state)
+        print(f"[.] Recon: headers for {domain}")
         headers_check(case_dir, state)
+        print(f"[.] Recon: robots for {domain}")
         robots_check(case_dir, state)
+        print(f"[.] Recon: whatweb for {domain}")
         whatweb_scan(case_dir, state)
+        print(f"[.] Recon: subdomains for {domain}")
         subdomain_enum(case_dir, state)
+        print(f"[.] Recon: crt.sh for {domain}")
         crtsh_lookup(case_dir, state)
+        print(f"[.] TLS probe for {domain}")
         ssl_tls_probe(case_dir, state)
+        print(f"[.] Shodan for {domain}")
         shodan_lookup(case_dir, state)
+        print(f"[.] AI assist for {domain}")
         ai_assist(case_dir, state)
+        print(f"[.] Report inputs for {domain}")
         report_inputs(case_dir, state)
+        print(f"[.] Risk scoring for {domain}")
         risk_scoring(case_dir, state)
+        print(f"[.] Generating report for {domain}")
         generate_report(case_dir, state)
         try:
             with open(case_dir / 'reports' / 'report.md', 'r', encoding='utf-8', errors='ignore') as f:
@@ -1571,12 +1623,15 @@ def process_batch_from_google_sheet(interactive: bool = True):
                     _drive_upload_file(drive, folder_id, str(full_txt_path), name='report_full_logs.txt', mime_type='text/plain')
             except Exception:
                 logger.exception("Failed to upload report_full_logs.txt to Drive")
+            print(f"[+] Uploaded to Drive folder '{folder_name}' for {domain}")
         sent_initial = False
         try:
             if email and emailed_flag != 'y':
+                print(f"[.] Sending email to {email} for {domain}")
                 sent_initial = send_outreach_post_report(case_dir, state, email, recipient_name=state.get('business_name'))
         except Exception:
             logger.exception("Batch email send failed for %s", state.get('domain'))
+            print(f"[!] Email send raised exception for {domain}")
         try:
             col_letter = _col_letter(gen_idx)
             cell_range = f"{sheet_name}!{col_letter}{r_idx+1}"
@@ -1586,8 +1641,10 @@ def process_batch_from_google_sheet(interactive: bool = True):
                 valueInputOption='RAW',
                 body={'values': [[ 'y' ]]}
             ).execute()
+            print(f"[+] Marked Report Generated = y for {website}")
         except Exception:
             logger.exception("Failed to update Report Generated for row %s", r_idx+1)
+            print(f"[!] Failed to update Report Generated for {website}")
         try:
             if sent_initial:
                 col_letter_e = _col_letter(emailed_idx)
@@ -1598,8 +1655,15 @@ def process_batch_from_google_sheet(interactive: bool = True):
                     valueInputOption='RAW',
                     body={'values': [[ 'y' ]]}
                 ).execute()
+                print(f"[+] Marked Emailed = y for {website}")
+            else:
+                if emailed_flag == 'y':
+                    print(f"[-] Emailed already y for {website}")
+                else:
+                    print(f"[!] Email not sent for {website}; leaving Emailed blank")
         except Exception:
             logger.exception("Failed to update Emailed for row %s", r_idx+1)
+            print(f"[!] Failed to update Emailed for {website}")
 
 def init_case_with_inputs(client: str, domain: str, business: str):
     logger.debug("init_case_with_inputs(): starting")
