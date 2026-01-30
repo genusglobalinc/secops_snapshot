@@ -29,6 +29,10 @@ import ssl
 import io
 import sys
 import argparse
+import smtplib
+from email.message import EmailMessage
+from email.utils import formatdate
+import mimetypes
 try:
     from openai import OpenAI as _OpenAIClient  # New-style client
 except Exception:  # pragma: no cover
@@ -99,6 +103,7 @@ if _log_level > logging.DEBUG:
 BASE_DIR = Path.home() / "secops"
 CLIENTS_DIR = BASE_DIR / "clients"
 CONFIG_FILE = BASE_DIR / "config.json"
+OUTREACH_LOG_FILE = BASE_DIR / "outreach.json"
 
 # Google integration settings
 GOOGLE_SCOPES = [
@@ -494,6 +499,290 @@ def _save_config(cfg: dict) -> None:
         CONFIG_FILE.write_text(tmp, encoding="utf-8")
     except Exception:
         logger.exception("Failed to save config at %s", CONFIG_FILE)
+
+def _load_outreach_log() -> dict:
+    try:
+        if OUTREACH_LOG_FILE.exists():
+            return json.loads(OUTREACH_LOG_FILE.read_text(encoding="utf-8", errors="ignore")) or {}
+    except Exception:
+        pass
+    return {"entries": []}
+
+def _save_outreach_log(data: dict) -> None:
+    try:
+        OUTREACH_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        OUTREACH_LOG_FILE.write_text(json.dumps(data or {"entries": []}, indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("Failed to save outreach log at %s", OUTREACH_LOG_FILE)
+
+def _get_or_create_outreach_entry(domain: str, email: str, init: dict = None) -> dict:
+    log = _load_outreach_log()
+    entries = log.get("entries") or []
+    key_dom = _normalize_domain(domain)
+    key_email = (email or "").strip().lower()
+    for e in entries:
+        if (e.get("domain") == key_dom) and (e.get("email") == key_email):
+            return e
+    entry = {"domain": key_dom, "email": key_email}
+    if init:
+        entry.update(init)
+    entries.append(entry)
+    log["entries"] = entries
+    _save_outreach_log(log)
+    return entry
+
+def _update_outreach_entry(entry: dict, updates: dict) -> None:
+    log = _load_outreach_log()
+    entries = log.get("entries") or []
+    for i, e in enumerate(entries):
+        if (e.get("domain") == entry.get("domain")) and (e.get("email") == entry.get("email")):
+            e.update(updates or {})
+            entries[i] = e
+            break
+    log["entries"] = entries
+    _save_outreach_log(log)
+
+EMAIL_TEMPLATE_INITIAL_SUBJ = "Passive security snapshot for {{Company Name}}"
+EMAIL_TEMPLATE_INITIAL_BODY = (
+    "Hi {{TeamOrName}},\n\n"
+    "I’m Jyasi Davis, reaching out because I recently completed a passive security exposure snapshot of {{Company Name}}’s public web presence.\n\n"
+    "This review used only publicly available information, no scanning, no login attempts, and no intrusive testing of any kind. The intent was simply to identify areas where publicly visible configuration details could increase risk over time.\n\n"
+    "I’ve attached a short PDF report for your reference.\n\n"
+    "It highlights a few items that are common for growing teams and are typically straightforward to address once identified.\n\n"
+    "If it’s helpful, I’m happy to:\n"
+    "- Walk through the findings briefly (10–15 minutes),\n"
+    "- Answer any questions after you’ve reviewed the report, or\n"
+    "- Leave it with you purely as informational reference, no obligation.\n\n"
+    "If you’d like a quick walkthrough, feel free to reply here or call/text me at 850-329-8951.\n\n"
+    "Best regards,\n"
+    "Jyasi Davis\n"
+    "Genus Studios\n"
+    "https://www.linkedin.com/in/jyasi-davis-7082241b4/\n"
+    "gstudiosdevops@gmail.com\n"
+    "850-329-8951\n"
+)
+
+EMAIL_TEMPLATE_FU1_SUBJ = "Following up on the passive security snapshot for {{Company Name}}"
+EMAIL_TEMPLATE_FU1_BODY = (
+    "Hi {{TeamOrName}},\n\n"
+    "I wanted to follow up on the passive security snapshot I shared a couple of days ago regarding {{Company Name}}’s public web presence.\n\n"
+    "The attached report highlights a few areas that are common for growing teams and are usually easy to address once identified.\n\n"
+    "If helpful, I can:\n"
+    "- Walk you through the findings briefly (10–15 minutes),\n"
+    "- Answer any questions after you’ve reviewed it, or\n"
+    "- Leave it with you purely as informational reference — no obligation.\n\n"
+    "I’m happy to coordinate a time that works for you. You can reply here or reach me directly at 850-329-8951.\n\n"
+    "Best regards,\n"
+    "Jyasi Davis\n"
+    "Genus Studios\n"
+    "https://www.linkedin.com/in/jyasi-davis-7082241b4/\n"
+    "gstudiosdevops@gmail.com\n"
+    "850-329-8951\n"
+)
+
+EMAIL_TEMPLATE_FU2_SUBJ = "Quick check-in on {{Company Name}}’s security snapshot"
+EMAIL_TEMPLATE_FU2_BODY = (
+    "Hi {{TeamOrName}},\n\n"
+    "I wanted to make one last check-in regarding the passive security snapshot I shared for {{Company Name}}’s public web presence.\n\n"
+    "Many small teams find these reports useful for quickly identifying low-effort, high-impact improvements to reduce security risk — even if it’s just to have the findings documented for future reference.\n\n"
+    "If it’s of interest, I’m happy to:\n"
+    "- Walk through the findings briefly (10–15 minutes),\n"
+    "- Answer any questions after review, or\n"
+    "- Simply leave the report for your records.\n\n"
+    "If now isn’t the right time, no worries at all — I’m happy to reconnect whenever it’s convenient for you. You can reply here or reach me at 850-329-8951.\n\n"
+    "Best regards,\n"
+    "Jyasi Davis\n"
+    "Genus Studios\n"
+    "https://www.linkedin.com/in/jyasi-davis-7082241b4/\n"
+    "gstudiosdevops@gmail.com\n"
+    "850-329-8951\n"
+)
+
+def _render_email(kind: str, company: str, team_or_name: str):
+    company = (company or "").strip() or "your team"
+    team = (team_or_name or "Team").strip()
+    if kind == "fu1":
+        subj = EMAIL_TEMPLATE_FU1_SUBJ.replace("{{Company Name}}", company)
+        body = EMAIL_TEMPLATE_FU1_BODY.replace("{{Company Name}}", company).replace("{{TeamOrName}}", team)
+    elif kind == "fu2":
+        subj = EMAIL_TEMPLATE_FU2_SUBJ.replace("{{Company Name}}", company)
+        body = EMAIL_TEMPLATE_FU2_BODY.replace("{{Company Name}}", company).replace("{{TeamOrName}}", team)
+    else:
+        subj = EMAIL_TEMPLATE_INITIAL_SUBJ.replace("{{Company Name}}", company)
+        body = EMAIL_TEMPLATE_INITIAL_BODY.replace("{{Company Name}}", company).replace("{{TeamOrName}}", team)
+    return _sanitize_ascii(subj), _sanitize_ascii(body)
+
+def setup_email_interactive():
+    cfg = _load_config()
+    ec = cfg.get("email_smtp") or {}
+    host = (ec.get("host") or prompt("SMTP server (e.g., smtp.gmail.com)")) or "smtp.gmail.com"
+    try:
+        port = int((ec.get("port") or prompt("SMTP port (587 for STARTTLS, 465 for SSL)")) or "587")
+    except Exception:
+        port = 587
+    use_ssl = bool(ec.get("use_ssl"))
+    use_tls = bool(ec.get("use_tls", True))
+    if not use_ssl and not use_tls:
+        use_tls = True
+    user = (ec.get("username") or prompt("SMTP username (usually your email)"))
+    from_email = (ec.get("from_email") or prompt("From email (address shown to recipients)")) or user
+    try:
+        prepared_by = _get_prepared_by(interactive=False)
+    except Exception:
+        prepared_by = ""
+    from_name = (ec.get("from_name") or prompt("From name (display name)")) or (prepared_by or "")
+    if yes_no("Save SMTP password to config for reuse?"):
+        pw = _prompt_secret("Enter SMTP password (or app password):")
+    else:
+        pw = ec.get("password", "")
+    new_cfg = {
+        "host": host,
+        "port": int(port),
+        "use_ssl": bool(use_ssl),
+        "use_tls": bool(use_tls),
+        "username": user,
+        "from_email": from_email,
+        "from_name": from_name,
+    }
+    if pw:
+        new_cfg["password"] = pw
+    cfg["email_smtp"] = new_cfg
+    _save_config(cfg)
+
+def _get_email_config(interactive: bool = True) -> dict:
+    cfg = _load_config()
+    ec = cfg.get("email_smtp") or {}
+    needed = ["host", "port", "username", "from_email"]
+    ok = all(str(ec.get(k) or "").strip() for k in needed)
+    if ok:
+        return ec
+    if interactive:
+        setup_email_interactive()
+        cfg = _load_config()
+        return cfg.get("email_smtp") or {}
+    return {}
+
+def _send_email(smtp_cfg: dict, to_email: str, subject: str, body: str, attachments: list = None) -> bool:
+    try:
+        to_email = (to_email or "").strip()
+        if not to_email:
+            return False
+        host = smtp_cfg.get("host")
+        port = int(smtp_cfg.get("port") or 587)
+        use_ssl = bool(smtp_cfg.get("use_ssl"))
+        use_tls = bool(smtp_cfg.get("use_tls", True))
+        user = smtp_cfg.get("username")
+        pw = smtp_cfg.get("password") or _prompt_secret("SMTP password:")
+        from_email = smtp_cfg.get("from_email") or user
+        from_name = smtp_cfg.get("from_name") or from_email
+        msg = EmailMessage()
+        if from_name and from_name != from_email:
+            msg["From"] = f"{from_name} <{from_email}>"
+        else:
+            msg["From"] = from_email
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=False)
+        msg.set_content(body)
+        for ap in (attachments or []):
+            try:
+                path = Path(ap)
+                if not path.exists():
+                    continue
+                ctype, enc = mimetypes.guess_type(str(path))
+                if ctype is None:
+                    ctype = "application/octet-stream"
+                maintype, subtype = ctype.split("/", 1)
+                with open(path, "rb") as f:
+                    data = f.read()
+                msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=path.name)
+            except Exception:
+                logger.exception("Failed attaching %s", ap)
+        if use_ssl:
+            server = smtplib.SMTP_SSL(host, port)
+        else:
+            server = smtplib.SMTP(host, port)
+        try:
+            server.ehlo()
+            if (not use_ssl) and use_tls:
+                server.starttls()
+                try:
+                    server.ehlo()
+                except Exception:
+                    pass
+            if user:
+                server.login(user, pw)
+            server.send_message(msg)
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
+        return True
+    except Exception:
+        logger.exception("Email send failed to %s", to_email)
+        return False
+
+def send_outreach_post_report(case_dir, state, to_email: str, recipient_name: str = None) -> bool:
+    company = state.get("business_name") or state.get("domain")
+    subject, body = _render_email("initial", company, recipient_name or "Team")
+    pdf_path = case_dir / "reports" / "report.pdf"
+    if pdf_path.exists():
+        atts = [str(pdf_path)]
+    else:
+        atts = [str(case_dir / "reports" / "report.md")]
+    smtp_cfg = _get_email_config(interactive=True)
+    ok = _send_email(smtp_cfg, to_email, subject, body, atts)
+    if ok:
+        now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        entry = _get_or_create_outreach_entry(state.get("domain"), to_email, init={
+            "client": state.get("client"),
+            "business_name": state.get("business_name"),
+            "report_path": atts[0],
+        })
+        _update_outreach_entry(entry, {"initial_sent_at": now})
+    return ok
+
+def _parse_iso(ts: str):
+    try:
+        return datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def process_due_followups() -> int:
+    smtp_cfg = _get_email_config(interactive=True)
+    log = _load_outreach_log()
+    entries = log.get("entries") or []
+    now = datetime.datetime.utcnow()
+    sent = 0
+    for e in entries:
+        dom = e.get("domain")
+        em = e.get("email")
+        company = e.get("business_name") or dom
+        report_path = e.get("report_path")
+        initial_ts = _parse_iso(e.get("initial_sent_at"))
+        fu1_ts = _parse_iso(e.get("followup1_sent_at"))
+        fu2_ts = _parse_iso(e.get("followup2_sent_at"))
+        try:
+            if initial_ts and (not fu1_ts):
+                if (now - initial_ts) >= datetime.timedelta(hours=48):
+                    subj, body = _render_email("fu1", company, "Team")
+                    ok = _send_email(smtp_cfg, em, subj, body, [p for p in [report_path] if p and Path(p).exists()])
+                    if ok:
+                        _update_outreach_entry(e, {"followup1_sent_at": now.replace(microsecond=0).isoformat() + "Z"})
+                        sent += 1
+                        continue
+            if fu1_ts and (not fu2_ts):
+                if (now - fu1_ts) >= datetime.timedelta(hours=72):
+                    subj, body = _render_email("fu2", company, "Team")
+                    ok = _send_email(smtp_cfg, em, subj, body, [p for p in [report_path] if p and Path(p).exists()])
+                    if ok:
+                        _update_outreach_entry(e, {"followup2_sent_at": now.replace(microsecond=0).isoformat() + "Z"})
+                        sent += 1
+                        continue
+        except Exception:
+            logger.exception("Follow-up processing failed for %s", em)
+    return sent
 
 def _get_openai_api_key(interactive: bool = True) -> str:
     env_key = os.getenv("OPENAI_API_KEY")
@@ -1131,16 +1420,18 @@ def process_batch_from_google_sheet():
     website_idx = cols['website']
     email_idx = cols['e-mail']
     gen_idx = cols['report generated']
+    emailed_idx = cols['emailed']
     for r_idx in range(1, len(rows)):
         row = rows[r_idx]
         def get(i):
             return row[i].strip() if i < len(row) and row[i] else ''
         website = get(website_idx)
-        email = get(email_idx)  # Not persisted; reserved for future emailing feature
+        email = get(email_idx)
         gen = get(gen_idx).lower()
+        emailed_flag = get(emailed_idx).lower()
         if not website:
             continue
-        if gen == 'y':
+        if gen == 'y' and emailed_flag == 'y':
             continue
         domain = _normalize_domain(website)
         # Resolve display business name from config mapping (fallback to domain)
@@ -1187,6 +1478,12 @@ def process_batch_from_google_sheet():
                     _drive_upload_file(drive, folder_id, str(full_txt_path), name='report_full_logs.txt', mime_type='text/plain')
             except Exception:
                 logger.exception("Failed to upload report_full_logs.txt to Drive")
+        sent_initial = False
+        try:
+            if email and emailed_flag != 'y':
+                sent_initial = send_outreach_post_report(case_dir, state, email, recipient_name=state.get('business_name'))
+        except Exception:
+            logger.exception("Batch email send failed for %s", state.get('domain'))
         try:
             col_letter = _col_letter(gen_idx)
             cell_range = f"{sheet_name}!{col_letter}{r_idx+1}"
@@ -1198,6 +1495,18 @@ def process_batch_from_google_sheet():
             ).execute()
         except Exception:
             logger.exception("Failed to update Report Generated for row %s", r_idx+1)
+        try:
+            if sent_initial:
+                col_letter_e = _col_letter(emailed_idx)
+                cell_range_e = f"{sheet_name}!{col_letter_e}{r_idx+1}"
+                sheets.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=cell_range_e,
+                    valueInputOption='RAW',
+                    body={'values': [[ 'y' ]]}
+                ).execute()
+        except Exception:
+            logger.exception("Failed to update Emailed for row %s", r_idx+1)
 
 def init_case_with_inputs(client: str, domain: str, business: str):
     logger.debug("init_case_with_inputs(): starting")
@@ -1797,14 +2106,14 @@ def main():
     # If Google not configured yet, trigger setup to ensure user sees OAuth prompts
     try:
         if _gbuild is not None and not _google_config_ready():
-            print("[i] Google integrations not configured; starting setup...")
-            setup_google_integration_interactive()
+            logger.debug("Google integrations not configured; will prompt for setup")
     except Exception:
-        logger.exception("Auto Google setup failed; continuing")
+        logger.exception("Auto Google setup check failed; continuing")
     # Offer to configure Google integrations up front so users see the OAuth/setup prompts
     try:
-        if yes_no("Configure Google integrations (Drive/Docs/Sheets) now?"):
-            setup_google_integration_interactive()
+        if _gbuild is not None and not _google_config_ready():
+            if yes_no("Configure Google integrations (Drive/Docs/Sheets) now?"):
+                setup_google_integration_interactive()
     except Exception:
         logger.exception("Google setup prompt failed; continuing")
     try:
@@ -1900,6 +2209,23 @@ def main():
     logger.debug("main(): generate_report() start")
     generate_report(case_dir, state)
     logger.debug("main(): generate_report() complete")
+    try:
+        if yes_no("Send initial outreach email with the report now?"):
+            suggested = _get_contact_for(state.get("domain")) or state.get("contact") or _get_default_contact(interactive=False)
+            rec = prompt(f"Recipient email (default {suggested})") or suggested
+            rec = (rec or "").strip()
+            if rec:
+                _remember_contact(state.get("domain"), rec)
+                ok = send_outreach_post_report(case_dir, state, rec, recipient_name=state.get("business_name"))
+                print("[+] Email sent" if ok else "[!] Email failed")
+    except Exception:
+        logger.exception("Interactive outreach email failed")
+    try:
+        if yes_no("Process any due follow-ups now?"):
+            n = process_due_followups()
+            print(f"[+] Follow-ups sent: {n}")
+    except Exception:
+        logger.exception("Follow-up processing failed")
 
     # Save final state
     with open(case_dir / "notes" / "state.json", "w") as f:
