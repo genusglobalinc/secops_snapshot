@@ -1381,6 +1381,21 @@ def _col_letter(idx_zero_based):
         s = chr(65 + r) + s
     return s
 
+def _should_auto_batch() -> bool:
+    try:
+        if _gbuild is None:
+            return False
+        cfg = _load_config()
+        auto = str(cfg.get("auto_batch", "")).strip().lower() in {"1", "true", "yes"}
+        if auto:
+            return True
+        # Default to batch if Google is fully configured and a Sheet is saved
+        if _google_config_ready() and cfg.get("google_sheet_id") and cfg.get("google_sheet_name"):
+            return True
+    except Exception:
+        return False
+    return False
+
 def _print_help_extended():
     try:
         txt = f"""
@@ -1451,7 +1466,7 @@ TIPS
         # Fallback minimal help if printing fails
         print("Extended help unavailable due to an error.")
 
-def process_batch_from_google_sheet():
+def process_batch_from_google_sheet(interactive: bool = True):
     drive, docs, sheets = _get_google_services()
     if not drive or not docs or not sheets:
         logger.warning("Google services unavailable; aborting batch mode")
@@ -1460,16 +1475,24 @@ def process_batch_from_google_sheet():
     sheet_id = cfg.get("google_sheet_id")
     sheet_name = cfg.get("google_sheet_name")
     # Ensure prepared_by and default contact are stored once
-    _ = _get_prepared_by(interactive=True)
-    _ = _get_default_contact(interactive=True)
+    _ = _get_prepared_by(interactive=interactive)
+    _ = _get_default_contact(interactive=interactive)
     if not sheet_id:
-        sheet_id = prompt("Google Sheet ID")
-        cfg["google_sheet_id"] = sheet_id
-        _save_config(cfg)
+        if interactive:
+            sheet_id = prompt("Google Sheet ID")
+            cfg["google_sheet_id"] = sheet_id
+            _save_config(cfg)
+        else:
+            logger.warning("google_sheet_id not set; cannot run batch non-interactively")
+            return
     if not sheet_name:
-        sheet_name = prompt("Sheet name (tab)")
-        cfg["google_sheet_name"] = sheet_name
-        _save_config(cfg)
+        if interactive:
+            sheet_name = prompt("Sheet name (tab)")
+            cfg["google_sheet_name"] = sheet_name
+            _save_config(cfg)
+        else:
+            logger.warning("google_sheet_name not set; cannot run batch non-interactively")
+            return
     clients_root_id = _drive_get_or_create_clients_root(drive)
     try:
         resp = sheets.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{sheet_name}!A:Z").execute()
@@ -2199,8 +2222,13 @@ def main():
     # Auto-batch via CLI flag or env var SECOPS_BATCH
     try:
         _env_batch = str(os.getenv("SECOPS_BATCH", "")).strip().lower() in {"1", "true", "yes"}
-        if _gbuild is not None and (args.batch or _env_batch):
-            process_batch_from_google_sheet()
+        # If batch was explicitly requested but Google libs are missing, do not fall back to single-case
+        if (args.batch or _env_batch) and (_gbuild is None):
+            print("[!] Google API libraries are not installed in this environment. Install: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib")
+            print("[!] Batch mode cannot run without Google libraries. Exiting.")
+            return
+        if _gbuild is not None and (args.batch or _env_batch or _should_auto_batch()):
+            process_batch_from_google_sheet(interactive=not (_env_batch or args.batch or _should_auto_batch()))
             print("[+] Batch processing complete")
             return
     except Exception:
