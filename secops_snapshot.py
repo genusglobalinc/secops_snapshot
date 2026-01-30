@@ -28,6 +28,7 @@ import socket
 import ssl
 import io
 import sys
+import argparse
 try:
     from openai import OpenAI as _OpenAIClient  # New-style client
 except Exception:  # pragma: no cover
@@ -1555,7 +1556,8 @@ def generate_report(case_dir, state):
     # - full: include all artifacts and run log
     mode_env = (os.getenv("SECOPS_ARTIFACT_MODE", "").strip().lower())
     include_full_flag = (os.getenv("SECOPS_INCLUDE_APPENDICES", "").strip().lower() in ("1", "true", "yes"))
-    artifact_mode = "full" if include_full_flag else (mode_env or "relevant")
+    # Prefer mode set in state (CLI-selected), then env toggles, default to 'full'
+    artifact_mode = (state.get("artifact_mode") or ("full" if include_full_flag else (mode_env or "full")))
 
     def subsection(title, body):
         body = (body or "").strip() or "(no data)"
@@ -1663,6 +1665,14 @@ def generate_report(case_dir, state):
 
 def main():
     logger.debug("Entering main()")
+    # CLI options
+    try:
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--artifact-mode", choices=["none", "relevant", "full"], dest="artifact_mode")
+        parser.add_argument("-h", "--help", action="help", help="show this help message and exit")
+        args, _unknown = parser.parse_known_args()
+    except Exception:
+        args = type("Args", (), {"artifact_mode": None})()
     # If Google not configured yet, trigger setup to ensure user sees OAuth prompts
     try:
         if _gbuild is not None and not _google_config_ready():
@@ -1690,6 +1700,10 @@ def main():
     except Exception:
         logger.exception("One-time prepared_by/default_contact setup failed; continuing")
     case_dir, state = init_case()
+    try:
+        state["artifact_mode"] = (args.artifact_mode or _load_config().get("artifact_mode") or "full")
+    except Exception:
+        state["artifact_mode"] = "full"
 
     # === Automated Passive Recon ===
     # Step: WHOIS lookup
