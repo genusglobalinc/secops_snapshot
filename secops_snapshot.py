@@ -613,29 +613,64 @@ def _render_email(kind: str, company: str, team_or_name: str):
         body = EMAIL_TEMPLATE_INITIAL_BODY.replace("{{Company Name}}", company).replace("{{TeamOrName}}", team)
     return _sanitize_ascii(subj), _sanitize_ascii(body)
 
-def setup_email_interactive():
+def setup_email_interactive(force_all: bool = False):
     cfg = _load_config()
     ec = cfg.get("email_smtp") or {}
-    host = (ec.get("host") or prompt("SMTP server (e.g., smtp.gmail.com)")) or "smtp.gmail.com"
-    try:
-        port = int((ec.get("port") or prompt("SMTP port (587 for STARTTLS, 465 for SSL)")) or "587")
-    except Exception:
-        port = 587
-    use_ssl = bool(ec.get("use_ssl"))
-    use_tls = bool(ec.get("use_tls", True))
-    if not use_ssl and not use_tls:
-        use_tls = True
-    user = (ec.get("username") or prompt("SMTP username (usually your email)"))
-    from_email = (ec.get("from_email") or prompt("From email (address shown to recipients)")) or user
-    try:
-        prepared_by = _get_prepared_by(interactive=False)
-    except Exception:
-        prepared_by = ""
-    from_name = (ec.get("from_name") or prompt("From name (display name)")) or (prepared_by or "")
-    if yes_no("Save SMTP password to config for reuse?"):
-        pw = _prompt_secret("Enter SMTP password (or app password):")
+    if force_all:
+        cur_host = ec.get("host") or "smtp.gmail.com"
+        host_in = prompt(f"SMTP server (default {cur_host})")
+        host = host_in or cur_host
+        try:
+            cur_port = str(ec.get("port") or "587")
+            port_in = prompt(f"SMTP port (587 for STARTTLS, 465 for SSL) (default {cur_port})")
+            port = int(port_in or cur_port)
+        except Exception:
+            port = int(ec.get("port") or 587)
+        cur_user = ec.get("username") or ""
+        user_in = prompt(f"SMTP username (usually your email) (default {cur_user})")
+        user = user_in or cur_user
+        cur_from_email = ec.get("from_email") or user
+        from_email_in = prompt(f"From email (address shown to recipients) (default {cur_from_email})")
+        from_email = from_email_in or cur_from_email
+        try:
+            prepared_by = _get_prepared_by(interactive=False)
+        except Exception:
+            prepared_by = ""
+        cur_from_name = ec.get("from_name") or (prepared_by or "")
+        from_name_in = prompt(f"From name (display name) (default {cur_from_name})")
+        from_name = from_name_in or cur_from_name
+        # Infer TLS/SSL from port selection when forcing re-entry
+        if int(port) == 465:
+            use_ssl = True
+            use_tls = False
+        else:
+            use_ssl = False
+            use_tls = True
+        if yes_no("Save SMTP password to config for reuse?"):
+            pw = _prompt_secret("Enter SMTP password (or app password):")
+        else:
+            pw = ec.get("password", "")
     else:
-        pw = ec.get("password", "")
+        host = (ec.get("host") or prompt("SMTP server (e.g., smtp.gmail.com)")) or "smtp.gmail.com"
+        try:
+            port = int((ec.get("port") or prompt("SMTP port (587 for STARTTLS, 465 for SSL)")) or "587")
+        except Exception:
+            port = 587
+        use_ssl = bool(ec.get("use_ssl"))
+        use_tls = bool(ec.get("use_tls", True))
+        if not use_ssl and not use_tls:
+            use_tls = True
+        user = (ec.get("username") or prompt("SMTP username (usually your email)"))
+        from_email = (ec.get("from_email") or prompt("From email (address shown to recipients)")) or user
+        try:
+            prepared_by = _get_prepared_by(interactive=False)
+        except Exception:
+            prepared_by = ""
+        from_name = (ec.get("from_name") or prompt("From name (display name)")) or (prepared_by or "")
+        if yes_no("Save SMTP password to config for reuse?"):
+            pw = _prompt_secret("Enter SMTP password (or app password):")
+        else:
+            pw = ec.get("password", "")
     new_cfg = {
         "host": host,
         "port": int(port),
@@ -772,7 +807,7 @@ def send_outreach_post_report(case_dir, state, to_email: str, recipient_name: st
     if (not ok) and interactive:
         try:
             if yes_no("Email failed. Re-enter SMTP settings and retry now?"):
-                setup_email_interactive()
+                setup_email_interactive(force_all=True)
                 smtp_cfg = _get_email_config(interactive=True)
                 ok = _send_email(smtp_cfg, to_email, subject, body, atts)
         except Exception:
