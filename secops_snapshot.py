@@ -759,7 +759,7 @@ def _send_email(smtp_cfg: dict, to_email: str, subject: str, body: str, attachme
     print("[!] Email send failed after retry")
     return False
 
-def send_outreach_post_report(case_dir, state, to_email: str, recipient_name: str = None) -> bool:
+def send_outreach_post_report(case_dir, state, to_email: str, recipient_name: str = None, interactive: bool = True) -> bool:
     company = state.get("business_name") or state.get("domain")
     subject, body = _render_email("initial", company, recipient_name or "Team")
     pdf_path = case_dir / "reports" / "report.pdf"
@@ -769,6 +769,14 @@ def send_outreach_post_report(case_dir, state, to_email: str, recipient_name: st
         atts = [str(case_dir / "reports" / "report.md")]
     smtp_cfg = _get_email_config(interactive=True)
     ok = _send_email(smtp_cfg, to_email, subject, body, atts)
+    if (not ok) and interactive:
+        try:
+            if yes_no("Email failed. Re-enter SMTP settings and retry now?"):
+                setup_email_interactive()
+                smtp_cfg = _get_email_config(interactive=True)
+                ok = _send_email(smtp_cfg, to_email, subject, body, atts)
+        except Exception:
+            logger.exception("Interactive SMTP retry failed")
     if ok:
         now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
         entry = _get_or_create_outreach_entry(state.get("domain"), to_email, init={
@@ -1643,7 +1651,13 @@ def process_batch_from_google_sheet(interactive: bool = True):
         try:
             if email and emailed_flag != 'y':
                 print(f"[.] Sending email to {email} for {domain}")
-                sent_initial = send_outreach_post_report(case_dir, state, email, recipient_name=state.get('business_name'))
+                sent_initial = send_outreach_post_report(
+                    case_dir,
+                    state,
+                    email,
+                    recipient_name=state.get('business_name'),
+                    interactive=interactive,
+                )
         except Exception:
             logger.exception("Batch email send failed for %s", state.get('domain'))
             print(f"[!] Email send raised exception for {domain}")
@@ -2309,8 +2323,12 @@ def main():
             print("[!] Google API libraries are not installed in this environment. Install: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib")
             print("[!] Batch mode cannot run without Google libraries. Exiting.")
             return
+        # Batch is interactive by default unless SECOPS_NON_INTERACTIVE or SECOPS_AUTO are set
+        _env_non_interactive = str(os.getenv("SECOPS_NON_INTERACTIVE", "")).strip().lower() in {"1", "true", "yes"}
+        _env_auto = str(os.getenv("SECOPS_AUTO", "")).strip().lower() in {"1", "true", "yes"}
+        _interactive_batch = not (_env_non_interactive or _env_auto)
         if _gbuild is not None and (args.batch or _env_batch or _should_auto_batch()):
-            process_batch_from_google_sheet(interactive=not (_env_batch or args.batch or _should_auto_batch()))
+            process_batch_from_google_sheet(interactive=_interactive_batch)
             print("[+] Batch processing complete")
             return
     except Exception:
