@@ -1570,49 +1570,64 @@ def process_batch_from_google_sheet(interactive: bool = True):
         cfg_names = (_load_config().get('business_names') or {})
         business = cfg_names.get(domain) or domain
         client = _safe_slug(domain)
-        case_dir, state = init_case_with_inputs(client, domain, business)
-        # Do not persist or rely on per-row email; use user's default contact for reports
-        state['contact'] = state.get('contact') or _get_default_contact(interactive=False)
-        prepared_by = _get_prepared_by(interactive=False)
-        state['prepared_by'] = prepared_by
-        print(f"[.] Recon: whois for {domain}")
-        whois_lookup(case_dir, state)
-        print(f"[.] Recon: dns for {domain}")
-        dns_lookup(case_dir, state)
-        print(f"[.] Recon: headers for {domain}")
-        headers_check(case_dir, state)
-        print(f"[.] Recon: robots for {domain}")
-        robots_check(case_dir, state)
-        print(f"[.] Recon: whatweb for {domain}")
-        whatweb_scan(case_dir, state)
-        print(f"[.] Recon: subdomains for {domain}")
-        subdomain_enum(case_dir, state)
-        print(f"[.] Recon: crt.sh for {domain}")
-        crtsh_lookup(case_dir, state)
-        print(f"[.] TLS probe for {domain}")
-        ssl_tls_probe(case_dir, state)
-        print(f"[.] Shodan for {domain}")
-        shodan_lookup(case_dir, state)
-        print(f"[.] AI assist for {domain}")
-        ai_assist(case_dir, state)
-        print(f"[.] Report inputs for {domain}")
-        report_inputs(case_dir, state)
-        print(f"[.] Risk scoring for {domain}")
-        risk_scoring(case_dir, state)
-        print(f"[.] Generating report for {domain}")
-        generate_report(case_dir, state)
+        skip_recon = (gen == 'y')
+        if skip_recon:
+            print(f"[=] Report already generated for {domain}; skipping recon and regeneration")
+            case_dir = CLIENTS_DIR / client
+            # Minimal state for emailing and context
+            state = {
+                "client": client,
+                "business_name": business,
+                "domain": domain,
+                "date": str(datetime.date.today()),
+            }
+        else:
+            case_dir, state = init_case_with_inputs(client, domain, business)
+            # Do not persist or rely on per-row email; use user's default contact for reports
+            state['contact'] = state.get('contact') or _get_default_contact(interactive=False)
+            prepared_by = _get_prepared_by(interactive=False)
+            state['prepared_by'] = prepared_by
+            print(f"[.] Recon: whois for {domain}")
+            whois_lookup(case_dir, state)
+            print(f"[.] Recon: dns for {domain}")
+            dns_lookup(case_dir, state)
+            print(f"[.] Recon: headers for {domain}")
+            headers_check(case_dir, state)
+            print(f"[.] Recon: robots for {domain}")
+            robots_check(case_dir, state)
+            print(f"[.] Recon: whatweb for {domain}")
+            whatweb_scan(case_dir, state)
+            print(f"[.] Recon: subdomains for {domain}")
+            subdomain_enum(case_dir, state)
+            print(f"[.] Recon: crt.sh for {domain}")
+            crtsh_lookup(case_dir, state)
+            print(f"[.] TLS probe for {domain}")
+            ssl_tls_probe(case_dir, state)
+            print(f"[.] Shodan for {domain}")
+            shodan_lookup(case_dir, state)
+            print(f"[.] AI assist for {domain}")
+            ai_assist(case_dir, state)
+            print(f"[.] Report inputs for {domain}")
+            report_inputs(case_dir, state)
+            print(f"[.] Risk scoring for {domain}")
+            risk_scoring(case_dir, state)
+            print(f"[.] Generating report for {domain}")
+            generate_report(case_dir, state)
         try:
             with open(case_dir / 'reports' / 'report.md', 'r', encoding='utf-8', errors='ignore') as f:
                 report_text = f.read()
         except Exception:
             report_text = ''
-        # Resolve folder under Clients root; try to match existing folders, then create if needed
-        cfg = _load_config()
-        mapping = (cfg.get('drive_folder_names') or {})
-        folder_id, folder_name = _drive_get_or_create_client_folder(
-            drive, clients_root_id, domain, state.get('business_name'), mapping
-        )
-        if folder_id:
+        # Resolve folder and upload only when generating a new report
+        if not skip_recon:
+            cfg = _load_config()
+            mapping = (cfg.get('drive_folder_names') or {})
+            folder_id, folder_name = _drive_get_or_create_client_folder(
+                drive, clients_root_id, domain, state.get('business_name'), mapping
+            )
+        else:
+            folder_id, folder_name = (None, None)
+        if folder_id and not skip_recon:
             title = f"{folder_name} Passive Security Exposure Snapshot"
             doc_id = _docs_create_in_folder(docs, drive, folder_id, title, report_text)
             if doc_id:
@@ -1632,19 +1647,22 @@ def process_batch_from_google_sheet(interactive: bool = True):
         except Exception:
             logger.exception("Batch email send failed for %s", state.get('domain'))
             print(f"[!] Email send raised exception for {domain}")
-        try:
-            col_letter = _col_letter(gen_idx)
-            cell_range = f"{sheet_name}!{col_letter}{r_idx+1}"
-            sheets.spreadsheets().values().update(
-                spreadsheetId=sheet_id,
-                range=cell_range,
-                valueInputOption='RAW',
-                body={'values': [[ 'y' ]]}
-            ).execute()
-            print(f"[+] Marked Report Generated = y for {website}")
-        except Exception:
-            logger.exception("Failed to update Report Generated for row %s", r_idx+1)
-            print(f"[!] Failed to update Report Generated for {website}")
+        if not skip_recon:
+            try:
+                col_letter = _col_letter(gen_idx)
+                cell_range = f"{sheet_name}!{col_letter}{r_idx+1}"
+                sheets.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=cell_range,
+                    valueInputOption='RAW',
+                    body={'values': [[ 'y' ]]}
+                ).execute()
+                print(f"[+] Marked Report Generated = y for {website}")
+            except Exception:
+                logger.exception("Failed to update Report Generated for row %s", r_idx+1)
+                print(f"[!] Failed to update Report Generated for {website}")
+        else:
+            print(f"[=] Report Generated already y for {website}; no update needed")
         try:
             if sent_initial:
                 col_letter_e = _col_letter(emailed_idx)
