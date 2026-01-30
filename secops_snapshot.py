@@ -343,6 +343,63 @@ def _sanitize_ascii(text: str) -> str:
             pass
     return "".join(out)
 
+def _summarize_shodan_text(text: str, max_ips: int = 10, max_ports: int = 10, max_cves: int = 10) -> str:
+    if not text:
+        return "(no Shodan data)"
+    import re as _re
+    ips = []
+    ports = {}
+    cves = set()
+    services = {k: 0 for k in [
+        "http", "https", "ssl", "ssh", "rdp", "ftp", "smtp", "imap", "pop3",
+        "mysql", "postgres", "mongodb", "redis", "elasticsearch", "memcached"
+    ]}
+    waf = {"cloudflare": 0}
+    for ln in text.splitlines():
+        l = ln.strip()
+        if not l:
+            continue
+        ll = l.lower()
+        # IPs
+        for ip in _re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", l):
+            if ip not in ips:
+                ips.append(ip)
+        # Ports via 'port: N' or ':N' after IP
+        for p in _re.findall(r"\bport[:=]\s*(\d{1,5})\b", ll):
+            ports[p] = ports.get(p, 0) + 1
+        for m in _re.finditer(r"\b(?:\d{1,3}\.){3}\d{1,3}[: ](\d{1,5})\b", l):
+            p = m.group(1)
+            ports[p] = ports.get(p, 0) + 1
+        # CVEs
+        for c in _re.findall(r"\bCVE-\d{4}-\d{3,7}\b", l, _re.I):
+            cves.add(c.upper())
+        # Services
+        for s in services.keys():
+            if s in ll:
+                services[s] += 1
+        # WAF/provider hints
+        if "cloudflare" in ll:
+            waf["cloudflare"] += 1
+    # Compose summary
+    lines = []
+    if ips:
+        lines.append(f"Unique IPs observed: {len(ips)}")
+        lines.append("Sample IPs: " + ", ".join(ips[:max_ips]))
+    if ports:
+        top_ports = sorted(ports.items(), key=lambda kv: (-kv[1], int(kv[0]) if kv[0].isdigit() else 0))[:max_ports]
+        lines.append("Top open ports: " + ", ".join([f"{p} (n={c})" for p, c in top_ports]))
+    notable_services = [f"{k} (n={v})" for k, v in services.items() if v]
+    if notable_services:
+        lines.append("Notable services: " + ", ".join(notable_services))
+    if cves:
+        top_cves = sorted(cves)[:max_cves]
+        lines.append("CVEs mentioned: " + ", ".join(top_cves))
+    if waf.get("cloudflare"):
+        lines.append("Provider/WAF indicators: Cloudflare")
+    if not lines:
+        return "(no salient Shodan signals found)"
+    return "\n".join(lines)
+
 def _load_config() -> dict:
     try:
         if CONFIG_FILE.exists():
@@ -1013,6 +1070,20 @@ def _docs_export_pdf_and_upload(drive, doc_id, folder_id, pdf_name):
         logger.exception("export pdf failed")
         return None
 
+def _drive_upload_file(drive, folder_id, local_path, name=None, mime_type='application/octet-stream'):
+    try:
+        if not _MediaFileUpload:
+            logger.warning("MediaFileUpload unavailable; cannot upload %s", local_path)
+            return None
+        lp = str(local_path)
+        nm = name or os.path.basename(lp)
+        media = _MediaFileUpload(lp, mimetype=mime_type, resumable=False)
+        file = drive.files().create(body={'name': nm, 'parents': [folder_id]}, media_body=media, fields='id').execute()
+        return file.get('id')
+    except Exception:
+        logger.exception("drive file upload failed for %s", local_path)
+        return None
+
 def _col_letter(idx_zero_based):
     n = idx_zero_based + 1
     s = ''
@@ -1110,6 +1181,12 @@ def process_batch_from_google_sheet():
             doc_id = _docs_create_in_folder(docs, drive, folder_id, title, report_text)
             if doc_id:
                 _docs_export_pdf_and_upload(drive, doc_id, folder_id, f"{folder_name}.pdf")
+            try:
+                full_txt_path = case_dir / 'reports' / 'report_full_logs.txt'
+                if full_txt_path.exists():
+                    _drive_upload_file(drive, folder_id, str(full_txt_path), name='report_full_logs.txt', mime_type='text/plain')
+            except Exception:
+                logger.exception("Failed to upload report_full_logs.txt to Drive")
         try:
             col_letter = _col_letter(gen_idx)
             cell_range = f"{sheet_name}!{col_letter}{r_idx+1}"
@@ -1556,8 +1633,8 @@ def generate_report(case_dir, state):
     # - full: include all artifacts and run log
     mode_env = (os.getenv("SECOPS_ARTIFACT_MODE", "").strip().lower())
     include_full_flag = (os.getenv("SECOPS_INCLUDE_APPENDICES", "").strip().lower() in ("1", "true", "yes"))
-    # Prefer mode set in state (CLI-selected), then env toggles, default to 'full'
-    artifact_mode = (state.get("artifact_mode") or ("full" if include_full_flag else (mode_env or "full")))
+    # Prefer mode set in state (CLI-selected), then env toggles, default to 'relevant'
+    artifact_mode = (state.get("artifact_mode") or ("full" if include_full_flag else (mode_env or "relevant")))
 
     def subsection(title, body):
         body = (body or "").strip() or "(no data)"
@@ -1573,7 +1650,16 @@ def generate_report(case_dir, state):
         appendix += subsection("Subdomains (subfinder)", subdomains_txt)
         appendix += subsection("crt.sh", crtsh_txt)
         appendix += subsection("SSL/TLS", ssl_labs_txt)
-        appendix += subsection("Shodan", shodan_txt)
+        # Shodan inclusion honoring user preference
+        _incl = (state.get("shodan_include") or "excerpt").lower()
+        if _incl == "full":
+            appendix += subsection("Shodan", shodan_txt)
+        elif _incl == "summary":
+            appendix += subsection("Shodan (summary)", _summarize_shodan_text(shodan_txt))
+        else:
+            appendix += subsection("Shodan (summary)", _summarize_shodan_text(shodan_txt))
+            _lines = int(state.get("shodan_excerpt_lines") or 50)
+            appendix += subsection("Shodan (excerpt)", "\n".join(shodan_txt.splitlines()[:_lines]))
         logs = "\n".join(getattr(_log_memory_handler, "records", []))
         appendix += "\n\n## Appendix B: Run Log\n"
         appendix += subsection("Run Log", logs)
@@ -1619,9 +1705,17 @@ def generate_report(case_dir, state):
         # Tech Stack
         if (area.get("tech_stack", "Medium") != "Low") or _has_terms(obs_text, ["wordpress", "apache", "nginx", "iis", "jquery", "outdated", "version"]):
             appendix += subsection("WhatWeb", _filter_lines(whatweb_txt, max_lines=60))
-        # Shodan
+        # Shodan (summary / excerpt / full) in relevant mode
         if _has_terms(obs_text, ["shodan", "open port", "exposed", "service"]) or (area.get("domain_dns", "Medium") != "Low") or (area.get("ssl", "Medium") != "Low"):
-            appendix += subsection("Shodan", _filter_lines(shodan_txt, patterns=["port:", "vuln", "cve", "http", "ssl", "ssh", "rdp", "ftp"], max_lines=120))
+            _incl = (state.get("shodan_include") or "excerpt").lower()
+            if _incl == "full":
+                appendix += subsection("Shodan", shodan_txt)
+            elif _incl == "summary":
+                appendix += subsection("Shodan (summary)", _summarize_shodan_text(shodan_txt))
+            else:
+                appendix += subsection("Shodan (summary)", _summarize_shodan_text(shodan_txt))
+                excerpt_lines =  int(state.get("shodan_excerpt_lines") or 25)
+                appendix += subsection("Shodan (excerpt)", _filter_lines(shodan_txt, patterns=["port:", "cve", "http", "ssl", "ssh", "rdp", "ftp"], max_lines=excerpt_lines))
         # Subdomains
         if _has_terms(obs_text, ["subdomain", "staging", "dev", "admin"]) or (subdomains_txt.strip()):
             appendix += subsection("Subdomains (subfinder)", _filter_lines(subdomains_txt, max_lines=80))
@@ -1629,6 +1723,31 @@ def generate_report(case_dir, state):
         if _has_terms(obs_text, ["registrar", "privacy", "whois", "expiration", "expires", "name server"]):
             appendix += subsection("WHOIS", _filter_lines(whois_txt, max_lines=60))
         report += appendix
+
+    # Always produce a separate comprehensive artifacts + run log file alongside the report
+    try:
+        full_txt = []
+        def _add_block(title, body):
+            full_txt.append(f"===== {title} =====\n")
+            full_txt.append(((body or "").strip()) + "\n\n")
+        _add_block("WHOIS", whois_txt)
+        _add_block("DNS (dig)", dns_txt)
+        _add_block("HTTP Headers", headers_txt)
+        _add_block("robots.txt", robots_txt)
+        _add_block("WhatWeb", whatweb_txt)
+        _add_block("Subdomains (subfinder)", subdomains_txt)
+        _add_block("crt.sh", crtsh_txt)
+        _add_block("SSL/TLS", ssl_labs_txt)
+        _add_block("Shodan", shodan_txt)
+        logs_all = "\n".join(getattr(_log_memory_handler, "records", []))
+        _add_block("Run Log", logs_all)
+        full_out = "".join(full_txt)
+        full_out = _sanitize_ascii(full_out)
+        full_path = case_dir / "reports" / "report_full_logs.txt"
+        full_path.write_text(full_out, encoding="utf-8")
+        logger.debug("generate_report(): wrote full artifacts to %s", full_path)
+    except Exception:
+        logger.exception("Failed writing comprehensive artifacts file")
 
     # Sanitize for ASCII-only (avoids LaTeX/PDF unicode issues) and write to case directory
     report = _sanitize_ascii(report)
@@ -1669,6 +1788,8 @@ def main():
     try:
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("--artifact-mode", choices=["none", "relevant", "full"], dest="artifact_mode")
+        parser.add_argument("--shodan-include", choices=["summary", "excerpt", "full"], dest="shodan_include")
+        parser.add_argument("--shodan-excerpt-lines", type=int, dest="shodan_excerpt_lines")
         parser.add_argument("-h", "--help", action="help", help="show this help message and exit")
         args, _unknown = parser.parse_known_args()
     except Exception:
@@ -1701,9 +1822,17 @@ def main():
         logger.exception("One-time prepared_by/default_contact setup failed; continuing")
     case_dir, state = init_case()
     try:
-        state["artifact_mode"] = (args.artifact_mode or _load_config().get("artifact_mode") or "full")
+        cfg0 = _load_config()
+        state["artifact_mode"] = (args.artifact_mode or cfg0.get("artifact_mode") or "relevant")
+        state["shodan_include"] = (args.shodan_include or cfg0.get("shodan_include") or "excerpt")
+        if getattr(args, "shodan_excerpt_lines", None):
+            try:
+                state["shodan_excerpt_lines"] = max(5, min(500, int(args.shodan_excerpt_lines)))
+            except Exception:
+                pass
     except Exception:
-        state["artifact_mode"] = "full"
+        state["artifact_mode"] = "relevant"
+        state["shodan_include"] = "excerpt"
 
     # === Automated Passive Recon ===
     # Step: WHOIS lookup
