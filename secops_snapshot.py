@@ -1966,21 +1966,34 @@ def update_phones_from_prospecting(interactive: bool = True, prospecting_tab: st
     def _extract_phones(text: str) -> list:
         if not text:
             return []
-        # Target US-style numbers to avoid grabbing random decimals or IDs
-        # Matches: (AAA) BBB-CCCC, AAA-BBB-CCCC, AAA.BBB.CCCC, AAA BBB CCCC, optional +1/1- prefix, optional ext/x 1234
-        pat = re.compile(r"(?<!\w)(?:\+?1[\s\-.]?)?\(?\s*(\d{3})\s*\)?[\s\-.]?(\d{3})[\s\-.]?(\d{4})(?:\s*(?:x|ext|extension)[\s\.:]*(\d{1,6}))?(?!\w)", re.IGNORECASE)
+        paren_pat = re.compile(
+            r"(?<!\d)(?:\+?1[\s\-.]?)?\(\s*(\d{3})\s*\)\s*(\d{3})[\s\-.]*?(\d{4})(?:\s*(?:x|ext|extension)\s*[\s\.:]*\s*(\d{1,6}))?(?!\d)",
+            re.IGNORECASE,
+        )
+        sep_pat = re.compile(
+            r"(?<!\d)(?:\+?1[\s\-.]?)?(\d{3})[\s\-.]+(\d{3})[\s\-.]+(\d{4})(?:\s*(?:x|ext|extension)\s*[\s\.:]*\s*(\d{1,6}))?(?!\d)",
+            re.IGNORECASE,
+        )
         results = []
         seen = set()
-        for m in pat.finditer(text):
+        def add_match(m):
             a, b, c, ext = m.group(1), m.group(2), m.group(3), m.group(4)
+            if a and (a[0] in '01'):
+                return
+            if b and (b[0] in '01'):
+                return
             key = f"{a}{b}{c}" + (f"x{ext}" if ext else "")
             if key in seen:
-                continue
+                return
             seen.add(key)
             norm = f"({a}) {b}-{c}"
             if ext:
                 norm += f" x{ext}"
             results.append(norm)
+        for m in paren_pat.finditer(text):
+            add_match(m)
+        for m in sep_pat.finditer(text):
+            add_match(m)
         return results
     def _scrape_phones_for_domain(domain: str) -> list:
         bases = [f"https://{domain}"]
@@ -1988,21 +2001,46 @@ def update_phones_from_prospecting(interactive: bool = True, prospecting_tab: st
             bases.append(f"https://{domain[4:]}")
         else:
             bases.append(f"https://www.{domain}")
-        paths = ["/", "/contact", "/contact/", "/contact-us", "/contact-us/", "/contact_us", "/contacts", "/about", "/about-us", "/privacy", "/privacy-policy", "/terms", "/support", "/help", "/legal"]
-        found = set()
+        paths = [
+            "/contact", "/contact/", "/contact-us", "/contact-us/", "/contact_us", "/contacts",
+            "/support", "/help", "/about", "/about-us", "/privacy", "/privacy-policy", "/terms", "/legal",
+            "/",
+        ]
+        found = []
+        seen = set()
+        def _add(ph: str):
+            if ph and ph not in seen:
+                seen.add(ph)
+                found.append(ph)
         for base in bases:
             for p in paths:
                 html = _http_get(base + p)
                 if not html:
                     continue
-                phones = _extract_phones(html)
-                for ph in phones:
-                    found.add(ph)
+                try:
+                    for tm in re.finditer(r"href=[\'\"]tel:\s*([^\'\" >]+)[\'\"]", html, re.IGNORECASE):
+                        raw = tm.group(1)
+                        try:
+                            digits = re.sub(r"\D", "", raw)
+                        except Exception:
+                            digits = ""
+                        if len(digits) >= 10:
+                            last10 = digits[-10:]
+                            a, b, c = last10[0:3], last10[3:6], last10[6:10]
+                            if (a and a[0] not in '01') and (b and b[0] not in '01'):
+                                _add(f"({a}) {b}-{c}")
+                        else:
+                            for ph in _extract_phones(raw):
+                                _add(ph)
+                except Exception:
+                    pass
+                for ph in _extract_phones(html):
+                    _add(ph)
                 if found:
                     break
             if found:
                 break
-        return list(found)
+        return found
     try:
         prospect_resp = sheets.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{prospecting_tab}!A:Z").execute()
         prospect_rows = prospect_resp.get('values', [])
