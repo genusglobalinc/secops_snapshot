@@ -1966,20 +1966,22 @@ def update_phones_from_prospecting(interactive: bool = True, prospecting_tab: st
     def _extract_phones(text: str) -> list:
         if not text:
             return []
-        # broad capture of phone-like strings
-        raw = set(m.group(0) for m in re.finditer(r"\+?\d[\d\s().-]{7,}\d", text))
-        phones = []
-        seen_norm = set()
-        for r in raw:
-            digits = re.sub(r"\D", "", r)
-            if len(digits) < 10 or len(digits) > 15:
+        # Target US-style numbers to avoid grabbing random decimals or IDs
+        # Matches: (AAA) BBB-CCCC, AAA-BBB-CCCC, AAA.BBB.CCCC, AAA BBB CCCC, optional +1/1- prefix, optional ext/x 1234
+        pat = re.compile(r"(?<!\w)(?:\+?1[\s\-.]?)?\(?\s*(\d{3})\s*\)?[\s\-.]?(\d{3})[\s\-.]?(\d{4})(?:\s*(?:x|ext|extension)[\s\.:]*(\d{1,6}))?(?!\w)", re.IGNORECASE)
+        results = []
+        seen = set()
+        for m in pat.finditer(text):
+            a, b, c, ext = m.group(1), m.group(2), m.group(3), m.group(4)
+            key = f"{a}{b}{c}" + (f"x{ext}" if ext else "")
+            if key in seen:
                 continue
-            norm = digits
-            if norm in seen_norm:
-                continue
-            seen_norm.add(norm)
-            phones.append(r.strip())
-        return phones
+            seen.add(key)
+            norm = f"({a}) {b}-{c}"
+            if ext:
+                norm += f" x{ext}"
+            results.append(norm)
+        return results
     def _scrape_phones_for_domain(domain: str) -> list:
         bases = [f"https://{domain}"]
         if domain.startswith('www.'):
