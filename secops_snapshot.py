@@ -1784,6 +1784,45 @@ def update_emails_from_prospecting(interactive: bool = True, prospecting_tab: st
         if not domain:
             continue
         main_map[domain] = r_idx
+    # Simple HTTP fetch + regex scraping helpers (homepage/contact/privacy)
+    def _http_get(url: str, timeout: int = 10) -> str:
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+                try:
+                    return data.decode('utf-8', errors='ignore')
+                except Exception:
+                    return data.decode(errors='ignore')
+        except Exception:
+            return ""
+    def _extract_emails(text: str) -> list:
+        if not text:
+            return []
+        return list({m.group(0) for m in re.finditer(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text)})
+    def _scrape_emails_for_domain(domain: str) -> list:
+        bases = [f"https://{domain}"]
+        if domain.startswith('www.'):
+            bases.append(f"https://{domain[4:]}")
+        else:
+            bases.append(f"https://www.{domain}")
+        paths = ["/", "/contact", "/contact/", "/contact-us", "/contact-us/", "/contact_us", "/contacts", "/about", "/about-us", "/privacy", "/privacy-policy", "/terms", "/support", "/help", "/legal"]
+        found = set()
+        for base in bases:
+            for p in paths:
+                html = _http_get(base + p)
+                if not html:
+                    continue
+                emails = _extract_emails(html)
+                for e in emails:
+                    found.add(e)
+                if found:
+                    break
+            if found:
+                break
+        return list(found)
     try:
         prospect_resp = sheets.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{prospecting_tab}!A:Z").execute()
         prospect_rows = prospect_resp.get('values', [])
@@ -1824,6 +1863,12 @@ def update_emails_from_prospecting(interactive: bool = True, prospecting_tab: st
             cand.extend(re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", em_text))
         if notes_text:
             cand.extend(re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", notes_text))
+        if not cand:
+            print(f"[.] No email in prospecting for {domain}; scraping website")
+            scraped = _scrape_emails_for_domain(domain)
+            if scraped:
+                cand.extend(scraped)
+                print(f"[+] Found {len(scraped)} email(s) on site for {domain}; selecting first")
         if not cand:
             continue
         email_found = cand[0]
