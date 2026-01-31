@@ -795,13 +795,16 @@ def _send_email(smtp_cfg: dict, to_email: str, subject: str, body: str, attachme
     return False
 
 def send_outreach_post_report(case_dir, state, to_email: str, recipient_name: str = None, interactive: bool = True) -> bool:
-    company = state.get("business_name") or state.get("domain")
+    company = state.get("business_name") or ""
     subject, body = _render_email("initial", company, recipient_name or "Team")
     pdf_path = case_dir / "reports" / "report.pdf"
     if pdf_path.exists():
         atts = [str(pdf_path)]
     else:
         atts = [str(case_dir / "reports" / "report.md")]
+    logs_path = case_dir / "reports" / "report_full_logs.txt"
+    if logs_path.exists():
+        atts.append(str(logs_path))
     smtp_cfg = _get_email_config(interactive=True)
     ok = _send_email(smtp_cfg, to_email, subject, body, atts)
     if (not ok) and interactive:
@@ -2303,11 +2306,16 @@ def generate_report(case_dir, state):
         pdf_cwd = Path.cwd() / f"{safe_client}_report.pdf"
         for src, dst in ((md_path_case, pdf_case), (md_path_cwd, pdf_cwd)):
             logger.debug("generate_report(): invoking pandoc to produce %s", dst)
-            result = subprocess.run(
-                f"pandoc \"{src}\" -o \"{dst}\"",
-                shell=True
-            )
-            logger.debug("pandoc return code: %s", getattr(result, "returncode", None))
+            # Try with better margins; fall back to basic pandoc if it fails
+            cmd_with_margins = f"pandoc \"{src}\" -o \"{dst}\" -V geometry:margin=1in -V fontsize=11pt"
+            result = subprocess.run(cmd_with_margins, shell=True)
+            rc = getattr(result, "returncode", 1)
+            if rc != 0 or (not Path(dst).exists()):
+                logger.warning("pandoc with margins failed (rc=%s); retrying basic pandoc", rc)
+                result = subprocess.run(f"pandoc \"{src}\" -o \"{dst}\"", shell=True)
+                logger.debug("pandoc fallback return code: %s", getattr(result, "returncode", None))
+            else:
+                logger.debug("pandoc with margins succeeded")
 
     state["checklist"]["report_generated"] = True
 
