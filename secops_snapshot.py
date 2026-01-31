@@ -1525,6 +1525,7 @@ OPENAI (optional, for AI-assisted report composition)
 CLI FLAGS
 - --batch                 Run Google Sheets batch processing and exit
 - --update-emails        Pull emails from prospecting tab into main sheet and exit
+- --update-phone         Pull phone numbers from prospecting tab and site pages into main sheet and exit
 - --artifact-mode MODE    none | relevant | full (default relevant)
 - --shodan-include MODE   summary | excerpt | full (default excerpt)
 - --shodan-excerpt-lines N  number of lines for Shodan excerpt (default 25)
@@ -1896,6 +1897,181 @@ def update_emails_from_prospecting(interactive: bool = True, prospecting_tab: st
         except Exception:
             logger.exception("Failed to update email for %s", domain)
     print(f"[+] Update-emails complete. Scanned {scanned} rows; updated {updated}.")
+
+def update_phones_from_prospecting(interactive: bool = True, prospecting_tab: str = "query_prospecting__477386915"):
+    drive, docs, sheets = _get_google_services()
+    if not sheets:
+        logger.warning("Google Sheets unavailable; aborting update-phone")
+        return
+    cfg = _load_config()
+    sheet_id = cfg.get("google_sheet_id")
+    main_tab = cfg.get("google_sheet_name")
+    if not sheet_id:
+        if interactive:
+            sheet_id = prompt("Google Sheet ID")
+            cfg["google_sheet_id"] = sheet_id
+            _save_config(cfg)
+        else:
+            logger.warning("google_sheet_id not set; cannot update phones non-interactively")
+            return
+    if not main_tab:
+        if interactive:
+            main_tab = prompt("Main Sheet name (tab)")
+            cfg["google_sheet_name"] = main_tab
+            _save_config(cfg)
+        else:
+            logger.warning("google_sheet_name not set; cannot update phones non-interactively")
+            return
+    try:
+        main_resp = sheets.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{main_tab}!A:Z").execute()
+        main_rows = main_resp.get('values', [])
+    except Exception:
+        logger.exception("Failed to read main sheet for phones")
+        return
+    if not main_rows:
+        logger.warning("Main sheet has no rows")
+        return
+    main_header = [c.strip() for c in main_rows[0]]
+    main_cols = {name.lower(): i for i, name in enumerate(main_header)}
+    if 'website' not in main_cols:
+        logger.warning("Main sheet missing 'website' column")
+        return
+    if 'phone' not in main_cols:
+        logger.warning("Main sheet missing 'Phone' column")
+        return
+    main_website_idx = main_cols['website']
+    main_phone_idx = main_cols['phone']
+    main_map = {}
+    for r_idx in range(1, len(main_rows)):
+        row = main_rows[r_idx]
+        website = row[main_website_idx].strip() if main_website_idx < len(row) and row[main_website_idx] else ''
+        domain = _normalize_domain(website)
+        if not domain:
+            continue
+        main_map[domain] = r_idx
+    # HTTP fetch + regex helpers for phones
+    def _http_get(url: str, timeout: int = 10) -> str:
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+                try:
+                    return data.decode('utf-8', errors='ignore')
+                except Exception:
+                    return data.decode(errors='ignore')
+        except Exception:
+            return ""
+    def _extract_phones(text: str) -> list:
+        if not text:
+            return []
+        # broad capture of phone-like strings
+        raw = set(m.group(0) for m in re.finditer(r"\+?\d[\d\s().-]{7,}\d", text))
+        phones = []
+        seen_norm = set()
+        for r in raw:
+            digits = re.sub(r"\D", "", r)
+            if len(digits) < 10 or len(digits) > 15:
+                continue
+            norm = digits
+            if norm in seen_norm:
+                continue
+            seen_norm.add(norm)
+            phones.append(r.strip())
+        return phones
+    def _scrape_phones_for_domain(domain: str) -> list:
+        bases = [f"https://{domain}"]
+        if domain.startswith('www.'):
+            bases.append(f"https://{domain[4:]}")
+        else:
+            bases.append(f"https://www.{domain}")
+        paths = ["/", "/contact", "/contact/", "/contact-us", "/contact-us/", "/contact_us", "/contacts", "/about", "/about-us", "/privacy", "/privacy-policy", "/terms", "/support", "/help", "/legal"]
+        found = set()
+        for base in bases:
+            for p in paths:
+                html = _http_get(base + p)
+                if not html:
+                    continue
+                phones = _extract_phones(html)
+                for ph in phones:
+                    found.add(ph)
+                if found:
+                    break
+            if found:
+                break
+        return list(found)
+    try:
+        prospect_resp = sheets.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{prospecting_tab}!A:Z").execute()
+        prospect_rows = prospect_resp.get('values', [])
+    except Exception:
+        logger.exception("Failed to read prospecting tab for phones")
+        return
+    if not prospect_rows:
+        logger.warning("Prospecting sheet has no rows")
+        return
+    p_header = [c.strip() for c in prospect_rows[0]]
+    p_cols = {name.lower(): i for i, name in enumerate(p_header)}
+    def _find_idx(names: list):
+        for n in names:
+            if n in p_cols:
+                return p_cols[n]
+        return None
+    p_site_idx = _find_idx(['website', 'url', 'domain', 'website url', 'company website', 'site', 'link'])
+    p_phone_idx = _find_idx(['phone', 'phone number', 'phone_number', 'contact phone', 'telephone', 'tel'])
+    p_notes_idx = _find_idx(['info/notes', 'notes', 'info', 'comments'])
+    if p_site_idx is None:
+        logger.warning("Prospecting tab missing a website/url column")
+        return
+    updated = 0
+    scanned = 0
+    for r_idx in range(1, len(prospect_rows)):
+        row = prospect_rows[r_idx]
+        def get(i):
+            return row[i].strip() if i is not None and i < len(row) and row[i] else ''
+        website = get(p_site_idx)
+        domain = _normalize_domain(website)
+        if not domain:
+            continue
+        scanned += 1
+        ph_text = get(p_phone_idx) if p_phone_idx is not None else ''
+        notes_text = get(p_notes_idx) if p_notes_idx is not None else ''
+        cand = []
+        cand.extend(_extract_phones(ph_text))
+        cand.extend(_extract_phones(notes_text))
+        if not cand:
+            print(f"[.] No phone in prospecting for {domain}; scraping website")
+            scraped = _scrape_phones_for_domain(domain)
+            if scraped:
+                cand.extend(scraped)
+                print(f"[+] Found {len(scraped)} phone number(s) on site for {domain}; selecting first")
+        if not cand:
+            continue
+        phone_found = cand[0]
+        main_row_idx = main_map.get(domain)
+        if main_row_idx is None:
+            alt = domain[4:] if domain.startswith('www.') else ('www.' + domain)
+            main_row_idx = main_map.get(alt)
+        if main_row_idx is None:
+            continue
+        mr = main_rows[main_row_idx]
+        current_phone = mr[main_phone_idx].strip() if main_phone_idx < len(mr) and mr[main_phone_idx] else ''
+        if current_phone:
+            continue
+        col_letter = _col_letter(main_phone_idx)
+        cell_range = f"{main_tab}!{col_letter}{main_row_idx+1}"
+        try:
+            sheets.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=cell_range,
+                valueInputOption='RAW',
+                body={'values': [[ phone_found ]]}
+            ).execute()
+            updated += 1
+            print(f"[+] Set Phone for {domain} to {phone_found}")
+        except Exception:
+            logger.exception("Failed to update phone for %s", domain)
+    print(f"[+] Update-phone complete. Scanned {scanned} rows; updated {updated}.")
 
 def init_case_with_inputs(client: str, domain: str, business: str):
     logger.debug("init_case_with_inputs(): starting")
@@ -2495,11 +2671,12 @@ def main():
         parser.add_argument("--shodan-excerpt-lines", type=int, dest="shodan_excerpt_lines")
         parser.add_argument("--batch", action="store_true", dest="batch", help="Run Google Sheets batch processing and exit")
         parser.add_argument("--update-emails", action="store_true", dest="update_emails", help="Pull emails from prospecting tab into main sheet where missing and exit")
+        parser.add_argument("--update-phone", action="store_true", dest="update_phone", help="Pull phone numbers into main sheet where missing and exit")
         parser.add_argument("--help-all", action="store_true", dest="help_all", help="Show extended help and exit")
         parser.add_argument("-h", "--help", action="help", help="show this help message and exit")
         args, _unknown = parser.parse_known_args()
     except Exception:
-        args = type("Args", (), {"artifact_mode": None, "batch": False, "update_emails": False, "help_all": False})()
+        args = type("Args", (), {"artifact_mode": None, "batch": False, "update_emails": False, "update_phone": False, "help_all": False})()
     # Extended help early exit
     try:
         _env_help_all = str(os.getenv("SECOPS_HELP_ALL", "")).strip().lower() in {"1", "true", "yes"}
@@ -2518,6 +2695,16 @@ def main():
             return
     except Exception:
         logger.exception("update-emails mode failed; continuing")
+    # Update-phone early exit mode
+    try:
+        if getattr(args, "update_phone", False):
+            _env_non_interactive = str(os.getenv("SECOPS_NON_INTERACTIVE", "")).strip().lower() in {"1", "true", "yes"}
+            _env_auto = str(os.getenv("SECOPS_AUTO", "")).strip().lower() in {"1", "true", "yes"}
+            _interactive = not (_env_non_interactive or _env_auto)
+            update_phones_from_prospecting(interactive=_interactive)
+            return
+    except Exception:
+        logger.exception("update-phone mode failed; continuing")
     # If Google not configured yet, trigger setup to ensure user sees OAuth prompts
     try:
         if _gbuild is not None and not _google_config_ready():
